@@ -130,8 +130,9 @@ $view = [
     'email' => '',
     'status' => '',
     'payment_status' => '',
+    'payer_email' => '',
     'plan_code' => 'basico',
-    'amount' => '100',
+    'amount' => '350',
     'currency_id' => 'CLP',
 ];
 
@@ -234,6 +235,7 @@ if ($view['error'] === '') {
                 $view['ok'] = true;
                 $view['company_name'] = (string)$signup['company_name'];
                 $view['email'] = (string)$signup['email'];
+                $view['payer_email'] = (string)$signup['email'];
                 $view['status'] = (string)$signup['status'];
                 $view['payment_status'] = (string)$signup['payment_status'];
                 $view['plan_code'] = (string)$signup['plan_code'];
@@ -322,56 +324,69 @@ if ($view['error'] === '') {
                 }
                 $returnUrl = $scheme . '://' . $host . '/pago-resultado/?s=pending';
 
-                $payerEmail = '';
-                if (isset($view['email']) && filter_var((string)$view['email'], FILTER_VALIDATE_EMAIL)) {
-                    $payerEmail = (string)$view['email'];
+                $payerEmail = trim((string)($_POST['payer_email'] ?? $view['payer_email'] ?? $view['email'] ?? ''));
+                if (!filter_var($payerEmail, FILTER_VALIDATE_EMAIL)) {
+                    $view['error'] = 'Debes ingresar un email valido para continuar con Flow.';
                 }
 
-                $payload = [
-                    'commerceOrder' => $commerceOrder,
-                    'subject' => 'Plan Basico GesMan HERMES',
-                    'currency' => 'CLP',
-                    'amount' => (int)round((float)$view['amount']),
-                    'email' => $payerEmail,
-                    'urlConfirmation' => $notificationUrl,
-                    'urlReturn' => $returnUrl,
-                ];
-
-                $flow = flow_request('POST', '/payment/create', (string)$payCfg['public_key'], (string)$payCfg['access_token'], $payload, (string)$payCfg['environment']);
-                if (!$flow['ok'] || !is_array($flow['data'])) {
-                    error_log(
-                        'HERMES_FLOW_CREATE_ERROR: http=' . (int)$flow['http_code']
-                        . ' curl=' . (string)($flow['error'] ?? '')
-                        . ' payload=' . json_encode($payload, JSON_UNESCAPED_UNICODE)
-                        . ' response=' . (string)($flow['raw'] ?? '')
-                    );
-                    $view['error'] = 'No se pudo iniciar el checkout con Flow. Intenta nuevamente.';
+                if ($view['error'] !== '') {
+                    // Evita invocar Flow cuando faltan datos base del pagador.
                 } else {
-                    $flowUrl = (string)($flow['data']['url'] ?? '');
-                    $flowToken = (string)($flow['data']['token'] ?? '');
-                    $redirectUrl = ($flowUrl !== '' && $flowToken !== '') ? ($flowUrl . '?token=' . rawurlencode($flowToken)) : '';
+                    $view['payer_email'] = $payerEmail;
 
-                    if ($redirectUrl === '') {
-                        $view['error'] = 'Flow no devolvio una URL valida de pago.';
-                    } else {
-                        $insTx = $pdo->prepare(
-                            'INSERT INTO payment_transactions (signup_id, provider, external_reference, preference_id, status, amount, currency_id, idempotency_key, raw_payload_json)
-                             VALUES (:signup_id, :provider, :external_reference, :preference_id, :status, :amount, :currency_id, :idempotency_key, :raw_payload_json)'
+                    $payload = [
+                        'commerceOrder' => $commerceOrder,
+                        'subject' => 'Plan Basico GesMan HERMES',
+                        'currency' => 'CLP',
+                        'amount' => (int)round((float)$view['amount']),
+                        'email' => $payerEmail,
+                        'urlConfirmation' => $notificationUrl,
+                        'urlReturn' => $returnUrl,
+                    ];
+
+                    $flow = flow_request('POST', '/payment/create', (string)$payCfg['public_key'], (string)$payCfg['access_token'], $payload, (string)$payCfg['environment']);
+                    if (!$flow['ok'] || !is_array($flow['data'])) {
+                        $flowCode = is_array($flow['data']) ? (int)($flow['data']['code'] ?? 0) : 0;
+                        error_log(
+                            'HERMES_FLOW_CREATE_ERROR: http=' . (int)$flow['http_code']
+                            . ' curl=' . (string)($flow['error'] ?? '')
+                            . ' payload=' . json_encode($payload, JSON_UNESCAPED_UNICODE)
+                            . ' response=' . (string)($flow['raw'] ?? '')
                         );
-                        $insTx->execute([
-                            'signup_id' => (int)$signup['id'],
-                            'provider' => 'flow',
-                            'external_reference' => $externalReference,
-                            'preference_id' => $flowToken,
-                            'status' => 'payment_created',
-                            'amount' => (float)$view['amount'],
-                            'currency_id' => $view['currency_id'],
-                            'idempotency_key' => bin2hex(random_bytes(12)),
-                            'raw_payload_json' => json_encode($flow['data'], JSON_UNESCAPED_UNICODE),
-                        ]);
+                        if ($flowCode === 1901) {
+                            $view['error'] = 'Flow exige un monto minimo de $350 CLP para iniciar el checkout.';
+                        } elseif ($flowCode === 1620) {
+                            $view['error'] = 'Flow rechazo el email del pagador. Prueba con otro correo real y vuelve a intentar.';
+                        } else {
+                            $view['error'] = 'No se pudo iniciar el checkout con Flow. Intenta nuevamente.';
+                        }
+                    } else {
+                        $flowUrl = (string)($flow['data']['url'] ?? '');
+                        $flowToken = (string)($flow['data']['token'] ?? '');
+                        $redirectUrl = ($flowUrl !== '' && $flowToken !== '') ? ($flowUrl . '?token=' . rawurlencode($flowToken)) : '';
 
-                        header('Location: ' . $redirectUrl);
-                        exit;
+                        if ($redirectUrl === '') {
+                            $view['error'] = 'Flow no devolvio una URL valida de pago.';
+                        } else {
+                            $insTx = $pdo->prepare(
+                                'INSERT INTO payment_transactions (signup_id, provider, external_reference, preference_id, status, amount, currency_id, idempotency_key, raw_payload_json)
+                                 VALUES (:signup_id, :provider, :external_reference, :preference_id, :status, :amount, :currency_id, :idempotency_key, :raw_payload_json)'
+                            );
+                            $insTx->execute([
+                                'signup_id' => (int)$signup['id'],
+                                'provider' => 'flow',
+                                'external_reference' => $externalReference,
+                                'preference_id' => $flowToken,
+                                'status' => 'payment_created',
+                                'amount' => (float)$view['amount'],
+                                'currency_id' => $view['currency_id'],
+                                'idempotency_key' => bin2hex(random_bytes(12)),
+                                'raw_payload_json' => json_encode($flow['data'], JSON_UNESCAPED_UNICODE),
+                            ]);
+
+                            header('Location: ' . $redirectUrl);
+                            exit;
+                        }
                     }
                 }
             }
@@ -450,6 +465,21 @@ if ($view['error'] === '') {
     .list { margin: .65rem 0 0; padding-left: 1rem; }
     .list li { margin-bottom: .35rem; color: var(--muted); }
     .actions { display: flex; gap: .6rem; flex-wrap: wrap; }
+        .payer-row {
+            display: grid;
+            gap: .35rem;
+            margin: .75rem 0 .9rem;
+        }
+        .payer-row label { color: #cbd5e1; font-size: .86rem; }
+        .payer-row input {
+            border: 1px solid #475569;
+            border-radius: 10px;
+            background: #0f172a;
+            color: #f8fafc;
+            padding: .62rem .72rem;
+            font-size: .9rem;
+            width: min(420px, 100%);
+        }
     .btn {
       border: 1px solid #8b6500;
       border-radius: 10px;
@@ -475,7 +505,7 @@ if ($view['error'] === '') {
 <body>
   <main class="card">
     <h1>Pagar plan basico de validacion</h1>
-    <p>Este pago de $100 CLP permite validar el flujo real de onboarding y activacion con resguardos de seguridad.</p>
+    <p>Este pago de $350 CLP permite validar el flujo real de onboarding y activacion con resguardos de seguridad.</p>
 
     <?php if ($view['error'] !== ''): ?>
       <div class="msg err"><?= h($view['error']) ?></div>
@@ -497,6 +527,10 @@ if ($view['error'] === '') {
       <div class="actions">
         <form method="post" style="margin:0;">
           <input type="hidden" name="action" value="create_checkout">
+                    <div class="payer-row">
+                        <label for="payer_email">Email del pagador (Flow)</label>
+                        <input id="payer_email" name="payer_email" type="email" value="<?= h($view['payer_email'] !== '' ? $view['payer_email'] : $view['email']) ?>" required>
+                    </div>
                     <button class="btn" type="submit">Pagar ahora con Flow</button>
         </form>
         <a class="btn ghost" href="/">Volver al sitio</a>
