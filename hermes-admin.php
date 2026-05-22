@@ -77,12 +77,12 @@ function plan_name($plan)
     return 'Basico';
 }
 
-  function default_plan_prices_clp()
+  function default_plan_pricing_clp()
   {
     return [
-      'basico' => 350,
-      'pro' => 990,
-      'enterprise' => 1990,
+      'basico' => ['monthly' => 350, 'annual' => 3500],
+      'pro' => ['monthly' => 990, 'annual' => 9900],
+      'enterprise' => ['monthly' => 1990, 'annual' => 19900],
     ];
   }
 
@@ -204,7 +204,7 @@ $planCatalog = [
 ];
 
 $flash = ['type' => '', 'message' => ''];
-$planPricing = default_plan_prices_clp();
+$planPricing = default_plan_pricing_clp();
 $stats = [
     'signups_total' => 0,
     'email_ok' => 0,
@@ -292,6 +292,8 @@ try {
           id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
           plan_code VARCHAR(40) NOT NULL,
           amount_clp INT UNSIGNED NOT NULL DEFAULT 350,
+          monthly_amount_clp INT UNSIGNED NOT NULL DEFAULT 350,
+          annual_amount_clp INT UNSIGNED NOT NULL DEFAULT 3500,
           created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
           UNIQUE KEY uq_plan_pricing_code (plan_code)
@@ -316,6 +318,7 @@ try {
       // Compatibilidad con instalaciones anteriores del esquema.
       ensure_column($pdo, 'account_signups', 'payment_status', 'VARCHAR(20) NOT NULL DEFAULT "unpaid"');
       ensure_column($pdo, 'account_signups', 'plan_code', 'VARCHAR(40) NOT NULL DEFAULT "basico"');
+      ensure_column($pdo, 'account_signups', 'billing_cycle', 'VARCHAR(20) NOT NULL DEFAULT "monthly"');
       ensure_column($pdo, 'account_signups', 'tenant_company_id', 'BIGINT UNSIGNED NULL');
       ensure_column($pdo, 'account_signups', 'activated_at', 'DATETIME NULL');
 
@@ -323,7 +326,10 @@ try {
       ensure_column($pdo, 'tenant_companies', 'owner_email', 'VARCHAR(190) NULL');
       ensure_column($pdo, 'tenant_companies', 'contact_name', 'VARCHAR(190) NULL');
       ensure_column($pdo, 'tenant_companies', 'plan_status', 'VARCHAR(40) NOT NULL DEFAULT "pending_payment"');
+      ensure_column($pdo, 'tenant_companies', 'billing_cycle', 'VARCHAR(20) NOT NULL DEFAULT "monthly"');
       ensure_column($pdo, 'tenant_companies', 'is_enabled', 'TINYINT(1) NOT NULL DEFAULT 0');
+      ensure_column($pdo, 'plan_pricing', 'monthly_amount_clp', 'INT UNSIGNED NOT NULL DEFAULT 350');
+      ensure_column($pdo, 'plan_pricing', 'annual_amount_clp', 'INT UNSIGNED NOT NULL DEFAULT 3500');
       ensure_column($pdo, 'payment_method_settings', 'public_key_enc', 'TEXT NULL');
       ensure_column($pdo, 'payment_method_settings', 'access_token_enc', 'TEXT NULL');
 
@@ -368,14 +374,16 @@ try {
       );
 
       $seedPlanPrice = $pdo->prepare(
-        'INSERT INTO plan_pricing (plan_code, amount_clp)
-         VALUES (:plan_code, :amount_clp)
+        'INSERT INTO plan_pricing (plan_code, amount_clp, monthly_amount_clp, annual_amount_clp)
+         VALUES (:plan_code, :amount_clp, :monthly_amount_clp, :annual_amount_clp)
          ON DUPLICATE KEY UPDATE plan_code = plan_code'
       );
-      foreach (default_plan_prices_clp() as $seedPlanCode => $seedAmount) {
+      foreach (default_plan_pricing_clp() as $seedPlanCode => $seedCfg) {
         $seedPlanPrice->execute([
           'plan_code' => $seedPlanCode,
-          'amount_clp' => (int)$seedAmount,
+          'amount_clp' => (int)($seedCfg['monthly'] ?? 350),
+          'monthly_amount_clp' => (int)($seedCfg['monthly'] ?? 350),
+          'annual_amount_clp' => (int)($seedCfg['annual'] ?? 3500),
         ]);
       }
 
@@ -408,7 +416,7 @@ try {
                 $flash = ['type' => 'err', 'message' => 'Cuenta invalida para activar.'];
             } else {
                 $st = $pdo->prepare(
-                    'SELECT id, email, company_name, contact_name, phone, plan_code, status, payment_status, email_verified_at, tenant_company_id
+                  'SELECT id, email, company_name, contact_name, phone, plan_code, billing_cycle, status, payment_status, email_verified_at, tenant_company_id
                      FROM account_signups
                      WHERE id = :id
                      LIMIT 1'
@@ -425,8 +433,12 @@ try {
                 } else {
                     $companyId = (int)($signup['tenant_company_id'] ?? 0);
                     $planCode = strtolower(trim((string)($signup['plan_code'] ?? 'basico')));
+                    $billingCycle = strtolower(trim((string)($signup['billing_cycle'] ?? 'monthly')));
                     if (!isset($planCatalog[$planCode])) {
                         $planCode = 'basico';
+                    }
+                    if (!in_array($billingCycle, ['monthly', 'annual'], true)) {
+                      $billingCycle = 'monthly';
                     }
 
                     if ($companyId > 0) {
@@ -437,6 +449,7 @@ try {
                                  contact_name = :contact_name,
                                  phone = :phone,
                                  plan_code = :plan_code,
+                                 billing_cycle = :billing_cycle,
                                  plan_status = :plan_status,
                                  status = :status,
                                  is_enabled = :is_enabled
@@ -448,6 +461,7 @@ try {
                             'contact_name' => (string)$signup['contact_name'],
                             'phone' => ((string)$signup['phone'] !== '' ? (string)$signup['phone'] : null),
                             'plan_code' => $planCode,
+                            'billing_cycle' => $billingCycle,
                             'plan_status' => 'paid',
                             'status' => 'active',
                             'is_enabled' => 1,
@@ -468,8 +482,8 @@ try {
                         }
 
                         $insTenant = $pdo->prepare(
-                            'INSERT INTO tenant_companies (signup_id, company_name, company_slug, owner_email, contact_name, phone, plan_code, plan_status, is_enabled, status, created_by)
-                             VALUES (:signup_id, :company_name, :company_slug, :owner_email, :contact_name, :phone, :plan_code, :plan_status, :is_enabled, :status, :created_by)'
+                             'INSERT INTO tenant_companies (signup_id, company_name, company_slug, owner_email, contact_name, phone, plan_code, billing_cycle, plan_status, is_enabled, status, created_by)
+                              VALUES (:signup_id, :company_name, :company_slug, :owner_email, :contact_name, :phone, :plan_code, :billing_cycle, :plan_status, :is_enabled, :status, :created_by)'
                         );
                         $insTenant->execute([
                             'signup_id' => (int)$signup['id'],
@@ -479,6 +493,7 @@ try {
                             'contact_name' => (string)$signup['contact_name'],
                             'phone' => ((string)$signup['phone'] !== '' ? (string)$signup['phone'] : null),
                             'plan_code' => $planCode,
+                            'billing_cycle' => $billingCycle,
                             'plan_status' => 'paid',
                             'is_enabled' => 1,
                             'status' => 'active',
@@ -491,6 +506,7 @@ try {
                         'UPDATE account_signups
                          SET status = :status,
                              payment_status = :payment_status,
+                           billing_cycle = :billing_cycle,
                              tenant_company_id = :tenant_company_id,
                              activated_at = NOW()
                          WHERE id = :id'
@@ -498,6 +514,7 @@ try {
                     $upSignup->execute([
                         'status' => 'active',
                         'payment_status' => 'paid',
+                        'billing_cycle' => $billingCycle,
                         'tenant_company_id' => $companyId,
                         'id' => (int)$signup['id'],
                     ]);
@@ -511,6 +528,7 @@ try {
         if ($action === 'set_tenant_access') {
             $tenantId = (int)($_POST['tenant_id'] ?? 0);
             $planCode = strtolower(trim((string)($_POST['plan_code'] ?? 'basico')));
+            $billingCycle = strtolower(trim((string)($_POST['billing_cycle'] ?? 'monthly')));
             $planStatus = strtolower(trim((string)($_POST['plan_status'] ?? 'pending_payment')));
             $isEnabled = isset($_POST['is_enabled']) ? 1 : 0;
 
@@ -519,6 +537,9 @@ try {
             }
             if (!in_array($planStatus, ['pending_payment', 'paid', 'suspended'], true)) {
                 $planStatus = 'pending_payment';
+            }
+            if (!in_array($billingCycle, ['monthly', 'annual'], true)) {
+              $billingCycle = 'monthly';
             }
 
             if ($tenantId > 0) {
@@ -533,6 +554,7 @@ try {
                 $upTenant = $pdo->prepare(
                     'UPDATE tenant_companies
                      SET plan_code = :plan_code,
+                       billing_cycle = :billing_cycle,
                          plan_status = :plan_status,
                          is_enabled = :is_enabled,
                          status = :status
@@ -540,6 +562,7 @@ try {
                 );
                 $upTenant->execute([
                     'plan_code' => $planCode,
+                    'billing_cycle' => $billingCycle,
                     'plan_status' => $planStatus,
                     'is_enabled' => $isEnabled,
                     'status' => $status,
@@ -549,12 +572,14 @@ try {
                 $upSignup = $pdo->prepare(
                     'UPDATE account_signups
                      SET plan_code = :plan_code,
+                       billing_cycle = :billing_cycle,
                          payment_status = CASE WHEN :plan_status = "paid" THEN "paid" ELSE payment_status END,
                          status = CASE WHEN :status = "active" THEN "active" WHEN :status = "suspended" THEN "suspended" ELSE status END
                      WHERE tenant_company_id = :tenant_company_id'
                 );
                 $upSignup->execute([
                     'plan_code' => $planCode,
+                    'billing_cycle' => $billingCycle,
                     'plan_status' => $planStatus,
                     'status' => $status,
                     'tenant_company_id' => $tenantId,
@@ -569,20 +594,27 @@ try {
 
           if ($action === 'save_plan_pricing') {
             $upPrice = $pdo->prepare(
-              'INSERT INTO plan_pricing (plan_code, amount_clp)
-               VALUES (:plan_code, :amount_clp)
-               ON DUPLICATE KEY UPDATE amount_clp = VALUES(amount_clp)'
+              'INSERT INTO plan_pricing (plan_code, amount_clp, monthly_amount_clp, annual_amount_clp)
+               VALUES (:plan_code, :amount_clp, :monthly_amount_clp, :annual_amount_clp)
+               ON DUPLICATE KEY UPDATE amount_clp = VALUES(amount_clp), monthly_amount_clp = VALUES(monthly_amount_clp), annual_amount_clp = VALUES(annual_amount_clp)'
             );
 
             foreach (array_keys($planCatalog) as $planCode) {
-              $raw = (string)($_POST['price_' . $planCode] ?? '');
-              $amount = (int)preg_replace('/[^0-9]/', '', $raw);
-              if ($amount < 350) {
-                $amount = 350;
+              $rawMonthly = (string)($_POST['price_monthly_' . $planCode] ?? '');
+              $rawAnnual = (string)($_POST['price_annual_' . $planCode] ?? '');
+              $amountMonthly = (int)preg_replace('/[^0-9]/', '', $rawMonthly);
+              $amountAnnual = (int)preg_replace('/[^0-9]/', '', $rawAnnual);
+              if ($amountMonthly < 350) {
+                $amountMonthly = 350;
+              }
+              if ($amountAnnual < 350) {
+                $amountAnnual = 350;
               }
               $upPrice->execute([
                 'plan_code' => $planCode,
-                'amount_clp' => $amount,
+                'amount_clp' => $amountMonthly,
+                'monthly_amount_clp' => $amountMonthly,
+                'annual_amount_clp' => $amountAnnual,
               ]);
             }
 
@@ -681,24 +713,28 @@ try {
     $stats['suspended_tenants'] = (int)$pdo->query('SELECT COUNT(*) FROM tenant_companies WHERE status = "suspended" OR is_enabled = 0')->fetchColumn();
 
     $signups = $pdo->query(
-        'SELECT id, email, company_name, contact_name, phone, plan_code, status, payment_status, email_verified_at, activated_at, created_at
+        'SELECT id, email, company_name, contact_name, phone, plan_code, billing_cycle, status, payment_status, email_verified_at, activated_at, created_at
          FROM account_signups
          ORDER BY id DESC
          LIMIT 120'
     )->fetchAll();
 
     $tenants = $pdo->query(
-        'SELECT id, signup_id, company_name, company_slug, owner_email, contact_name, phone, plan_code, plan_status, is_enabled, status, created_at
+        'SELECT id, signup_id, company_name, company_slug, owner_email, contact_name, phone, plan_code, billing_cycle, plan_status, is_enabled, status, created_at
          FROM tenant_companies
          ORDER BY id DESC
          LIMIT 120'
     )->fetchAll();
 
-    $priceRows = $pdo->query('SELECT plan_code, amount_clp FROM plan_pricing')->fetchAll();
+    $priceRows = $pdo->query('SELECT plan_code, amount_clp, monthly_amount_clp, annual_amount_clp FROM plan_pricing')->fetchAll();
     foreach ($priceRows as $rowPrice) {
       $code = strtolower(trim((string)($rowPrice['plan_code'] ?? '')));
       if (isset($planCatalog[$code])) {
-        $planPricing[$code] = max(350, (int)($rowPrice['amount_clp'] ?? 350));
+        $fallbackMonthly = max(350, (int)($rowPrice['amount_clp'] ?? 350));
+        $planPricing[$code] = [
+          'monthly' => max(350, (int)($rowPrice['monthly_amount_clp'] ?? $fallbackMonthly)),
+          'annual' => max(350, (int)($rowPrice['annual_amount_clp'] ?? ($fallbackMonthly * 10))),
+        ];
       }
     }
 
@@ -1005,6 +1041,7 @@ try {
                 <th>Contacto</th>
                 <th>Email</th>
                 <th>Plan</th>
+                <th>Modalidad</th>
                 <th>Email OK</th>
                 <th>Pago</th>
                 <th>Estado</th>
@@ -1013,7 +1050,7 @@ try {
             </thead>
             <tbody>
               <?php if (count($signups) === 0): ?>
-                <tr><td colspan="8">No hay registros de onboarding.</td></tr>
+                <tr><td colspan="9">No hay registros de onboarding.</td></tr>
               <?php else: ?>
                 <?php foreach ($signups as $s): ?>
                   <tr>
@@ -1021,6 +1058,7 @@ try {
                     <td><?= h($s['contact_name']) ?></td>
                     <td><?= h($s['email']) ?></td>
                     <td><span class="tag"><?= h(plan_name($s['plan_code'])) ?></span></td>
+                    <td><span class="tag"><?= h(((string)($s['billing_cycle'] ?? 'monthly') === 'annual') ? 'Anual' : 'Mensual') ?></span></td>
                     <td>
                       <?php if (!empty($s['email_verified_at'])): ?>
                         <span class="status ok">Verificado</span>
@@ -1072,6 +1110,7 @@ try {
                 <th>Slug</th>
                 <th>Owner email</th>
                 <th>Plan</th>
+                <th>Modalidad</th>
                 <th>Plan status</th>
                 <th>Acceso</th>
                 <th>Estado</th>
@@ -1080,7 +1119,7 @@ try {
             </thead>
             <tbody>
               <?php if (count($tenants) === 0): ?>
-                <tr><td colspan="8">No hay tenants activados aun.</td></tr>
+                <tr><td colspan="9">No hay tenants activados aun.</td></tr>
               <?php else: ?>
                 <?php foreach ($tenants as $t): ?>
                   <tr>
@@ -1088,6 +1127,7 @@ try {
                     <td><?= h($t['company_slug']) ?></td>
                     <td><?= h($t['owner_email']) ?></td>
                     <td><span class="tag"><?= h(plan_name($t['plan_code'])) ?></span></td>
+                    <td><span class="tag"><?= h(((string)($t['billing_cycle'] ?? 'monthly') === 'annual') ? 'Anual' : 'Mensual') ?></span></td>
                     <td><span class="status <?= ((string)$t['plan_status'] === 'paid' ? 'ok' : (((string)$t['plan_status'] === 'suspended') ? 'bad' : 'warn')) ?>"><?= h($t['plan_status']) ?></span></td>
                     <td><span class="status <?= ((int)$t['is_enabled'] === 1 ? 'ok' : 'bad') ?>"><?= ((int)$t['is_enabled'] === 1 ? 'Habilitado' : 'Bloqueado') ?></span></td>
                     <td><span class="status <?= ((string)$t['status'] === 'active' ? 'ok' : (((string)$t['status'] === 'suspended') ? 'bad' : 'warn')) ?>"><?= h($t['status']) ?></span></td>
@@ -1107,7 +1147,8 @@ try {
             <?php foreach ($planCatalog as $key => $plan): ?>
               <article class="card">
                 <div class="label">Plan <?= h($plan['name']) ?></div>
-                <div class="kpi" style="font-size:1.05rem;">$<?= h(number_format((int)($planPricing[$key] ?? 350), 0, ',', '.')) ?> CLP</div>
+                <div class="kpi" style="font-size:1.05rem;">Mensual: $<?= h(number_format((int)($planPricing[$key]['monthly'] ?? 350), 0, ',', '.')) ?> CLP</div>
+                <div class="kpi" style="font-size:.95rem;">Anual: $<?= h(number_format((int)($planPricing[$key]['annual'] ?? 3500), 0, ',', '.')) ?> CLP</div>
                 <ul class="stack">
                   <?php foreach ($plan['features'] as $feature): ?>
                     <li><?= h($feature) ?></li>
@@ -1120,14 +1161,15 @@ try {
 
         <section class="panel">
           <h2>Valores comerciales por plan</h2>
-          <p class="muted">Define aqui el monto base en CLP que se usara para checkout de onboarding/renovacion segun plan. Minimo permitido: $350 CLP.</p>
+          <p class="muted">Define aqui los montos en CLP por modalidad mensual y anual. Minimo permitido por Flow: $350 CLP.</p>
           <form method="post" autocomplete="off">
             <input type="hidden" name="action" value="save_plan_pricing">
             <table>
               <thead>
                 <tr>
                   <th>Plan</th>
-                  <th>Valor (CLP)</th>
+                  <th>Mensual (CLP)</th>
+                  <th>Anual (CLP)</th>
                 </tr>
               </thead>
               <tbody>
@@ -1139,8 +1181,18 @@ try {
                         type="number"
                         min="350"
                         step="1"
-                        name="price_<?= h($key) ?>"
-                        value="<?= h((string)((int)($planPricing[$key] ?? 350))) ?>"
+                        name="price_monthly_<?= h($key) ?>"
+                        value="<?= h((string)((int)($planPricing[$key]['monthly'] ?? 350))) ?>"
+                        style="max-width:180px;"
+                        required>
+                    </td>
+                    <td>
+                      <input
+                        type="number"
+                        min="350"
+                        step="1"
+                        name="price_annual_<?= h($key) ?>"
+                        value="<?= h((string)((int)($planPricing[$key]['annual'] ?? 3500))) ?>"
                         style="max-width:180px;"
                         required>
                     </td>
@@ -1162,6 +1214,7 @@ try {
                 <th>Empresa</th>
                 <th>Email owner</th>
                 <th>Plan</th>
+                <th>Modalidad</th>
                 <th>Plan status</th>
                 <th>Habilitado</th>
                 <th>Guardar</th>
@@ -1169,7 +1222,7 @@ try {
             </thead>
             <tbody>
               <?php if (count($tenants) === 0): ?>
-                <tr><td colspan="6">No hay tenants para configurar.</td></tr>
+                <tr><td colspan="7">No hay tenants para configurar.</td></tr>
               <?php else: ?>
                 <?php foreach ($tenants as $t): ?>
                   <tr>
@@ -1183,6 +1236,12 @@ try {
                           <option value="basico" <?= ((string)$t['plan_code'] === 'basico' ? 'selected' : '') ?>>Basico</option>
                           <option value="pro" <?= ((string)$t['plan_code'] === 'pro' ? 'selected' : '') ?>>Pro</option>
                           <option value="enterprise" <?= ((string)$t['plan_code'] === 'enterprise' ? 'selected' : '') ?>>Enterprise</option>
+                        </select>
+                    </td>
+                    <td>
+                        <select name="billing_cycle">
+                          <option value="monthly" <?= ((string)($t['billing_cycle'] ?? 'monthly') === 'monthly' ? 'selected' : '') ?>>Mensual</option>
+                          <option value="annual" <?= ((string)($t['billing_cycle'] ?? 'monthly') === 'annual' ? 'selected' : '') ?>>Anual</option>
                         </select>
                     </td>
                     <td>

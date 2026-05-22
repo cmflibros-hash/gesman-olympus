@@ -181,10 +181,10 @@ function logo_public_url($relativePath)
     return number_format((float)$value, 0, ',', '.');
   }
 
-  function plan_cycle_days($planCode)
+  function billing_cycle_days($billingCycle)
   {
-    $code = strtolower(trim((string)$planCode));
-    if ($code === 'anual') {
+    $code = strtolower(trim((string)$billingCycle));
+    if ($code === 'annual' || $code === 'anual') {
       return 365;
     }
     return 30;
@@ -301,6 +301,8 @@ $dashCurrencyCode = 'CLP';
 $planBilling = [
   'payment_status' => 'unpaid',
   'plan_status' => 'pending_payment',
+  'billing_cycle' => 'monthly',
+  'billing_cycle_name' => 'Mensual',
   'is_enabled' => 0,
   'days_left' => null,
   'next_renewal_label' => 'Pendiente',
@@ -385,6 +387,7 @@ try {
         email_verified_at DATETIME NULL,
         payment_status VARCHAR(20) NOT NULL DEFAULT "unpaid",
         plan_code VARCHAR(40) NOT NULL DEFAULT "basico",
+        billing_cycle VARCHAR(20) NOT NULL DEFAULT "monthly",
         tenant_company_id BIGINT UNSIGNED NULL,
         activated_at DATETIME NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -401,6 +404,7 @@ try {
         contact_name VARCHAR(190) NULL,
         phone VARCHAR(40) NULL,
         plan_code VARCHAR(40) NOT NULL DEFAULT "basico",
+        billing_cycle VARCHAR(20) NOT NULL DEFAULT "monthly",
         plan_status VARCHAR(40) NOT NULL DEFAULT "pending_payment",
         is_enabled TINYINT(1) NOT NULL DEFAULT 0,
         status VARCHAR(40) NOT NULL DEFAULT "pending_payment",
@@ -557,8 +561,11 @@ try {
         UNIQUE KEY uq_usage_company (tenant_company_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
 
+      ensure_column($pdo, 'account_signups', 'billing_cycle', 'VARCHAR(20) NOT NULL DEFAULT "monthly"');
+      ensure_column($pdo, 'tenant_companies', 'billing_cycle', 'VARCHAR(20) NOT NULL DEFAULT "monthly"');
+
     if ($signupId > 0) {
-        $stSignup = $pdo->prepare('SELECT id, company_name, email, tenant_company_id, payment_status, plan_code, activated_at, created_at, payment_access_token, payment_access_expires_at FROM account_signups WHERE id = :id LIMIT 1');
+        $stSignup = $pdo->prepare('SELECT id, company_name, email, tenant_company_id, payment_status, plan_code, billing_cycle, activated_at, created_at, payment_access_token, payment_access_expires_at FROM account_signups WHERE id = :id LIMIT 1');
         $stSignup->execute(['id' => $signupId]);
         $signup = $stSignup->fetch();
         if ($signup) {
@@ -570,6 +577,12 @@ try {
             $tenantCompanyId = (int)($signup['tenant_company_id'] ?? 0);
             $planBilling['payment_status'] = strtolower(trim((string)($signup['payment_status'] ?? 'unpaid')));
             $planCodeFromSignup = (string)($signup['plan_code'] ?? 'basico');
+            $billingCycleFromSignup = strtolower(trim((string)($signup['billing_cycle'] ?? 'monthly')));
+            if (!in_array($billingCycleFromSignup, ['monthly', 'annual'], true)) {
+              $billingCycleFromSignup = 'monthly';
+            }
+            $planBilling['billing_cycle'] = $billingCycleFromSignup;
+            $planBilling['billing_cycle_name'] = ($billingCycleFromSignup === 'annual') ? 'Anual' : 'Mensual';
             if ($planCodeFromSignup !== '') {
               $usage['plan_code'] = $planCodeFromSignup;
             }
@@ -581,7 +594,7 @@ try {
               $planBilling['can_pay_renewal'] = true;
             }
 
-            $cycleDays = plan_cycle_days($usage['plan_code']);
+            $cycleDays = billing_cycle_days($planBilling['billing_cycle']);
             $referenceAt = trim((string)($signup['activated_at'] ?? ''));
             if ($referenceAt === '') {
               $referenceAt = trim((string)($signup['created_at'] ?? ''));
@@ -598,13 +611,19 @@ try {
     }
 
     if ($tenantCompanyId <= 0 && $signupId > 0) {
-        $stTenant = $pdo->prepare('SELECT id, plan_status, is_enabled, plan_code FROM tenant_companies WHERE signup_id = :signup_id LIMIT 1');
+        $stTenant = $pdo->prepare('SELECT id, plan_status, is_enabled, plan_code, billing_cycle FROM tenant_companies WHERE signup_id = :signup_id LIMIT 1');
         $stTenant->execute(['signup_id' => $signupId]);
         $row = $stTenant->fetch();
         if ($row) {
             $tenantCompanyId = (int)$row['id'];
             $planBilling['plan_status'] = strtolower(trim((string)($row['plan_status'] ?? 'pending_payment')));
             $planBilling['is_enabled'] = (int)($row['is_enabled'] ?? 0);
+            $tenantBillingCycle = strtolower(trim((string)($row['billing_cycle'] ?? 'monthly')));
+            if (!in_array($tenantBillingCycle, ['monthly', 'annual'], true)) {
+              $tenantBillingCycle = 'monthly';
+            }
+            $planBilling['billing_cycle'] = $tenantBillingCycle;
+            $planBilling['billing_cycle_name'] = ($tenantBillingCycle === 'annual') ? 'Anual' : 'Mensual';
             if (!empty($row['plan_code'])) {
               $usage['plan_code'] = (string)$row['plan_code'];
             }
@@ -612,13 +631,19 @@ try {
     }
 
     if ($tenantCompanyId <= 0 && $accountLoginEmail !== '') {
-        $stTenant = $pdo->prepare('SELECT id, plan_status, is_enabled, plan_code FROM tenant_companies WHERE owner_email = :owner_email LIMIT 1');
+        $stTenant = $pdo->prepare('SELECT id, plan_status, is_enabled, plan_code, billing_cycle FROM tenant_companies WHERE owner_email = :owner_email LIMIT 1');
       $stTenant->execute(['owner_email' => $accountLoginEmail]);
         $row = $stTenant->fetch();
         if ($row) {
             $tenantCompanyId = (int)$row['id'];
             $planBilling['plan_status'] = strtolower(trim((string)($row['plan_status'] ?? 'pending_payment')));
             $planBilling['is_enabled'] = (int)($row['is_enabled'] ?? 0);
+            $tenantBillingCycle = strtolower(trim((string)($row['billing_cycle'] ?? 'monthly')));
+            if (!in_array($tenantBillingCycle, ['monthly', 'annual'], true)) {
+              $tenantBillingCycle = 'monthly';
+            }
+            $planBilling['billing_cycle'] = $tenantBillingCycle;
+            $planBilling['billing_cycle_name'] = ($tenantBillingCycle === 'annual') ? 'Anual' : 'Mensual';
             if (!empty($row['plan_code'])) {
               $usage['plan_code'] = (string)$row['plan_code'];
             }
@@ -639,8 +664,8 @@ try {
             $slug = substr($slugBase, 0, 75) . '-' . $n;
         }
 
-        $columns = 'signup_id, company_name, company_slug, owner_email, contact_name, phone, plan_code, plan_status, is_enabled, status, created_by';
-        $values = ':signup_id, :company_name, :company_slug, :owner_email, :contact_name, :phone, :plan_code, :plan_status, :is_enabled, :status, :created_by';
+        $columns = 'signup_id, company_name, company_slug, owner_email, contact_name, phone, plan_code, billing_cycle, plan_status, is_enabled, status, created_by';
+        $values = ':signup_id, :company_name, :company_slug, :owner_email, :contact_name, :phone, :plan_code, :billing_cycle, :plan_status, :is_enabled, :status, :created_by';
         $params = [
             'signup_id' => ($signupId > 0 ? $signupId : null),
             'company_name' => $companyName,
@@ -649,6 +674,7 @@ try {
             'contact_name' => null,
             'phone' => null,
             'plan_code' => 'basico',
+          'billing_cycle' => 'monthly',
             'plan_status' => 'paid',
             'is_enabled' => 1,
             'status' => 'active',
@@ -1277,19 +1303,19 @@ try {
       if ($planBilling['days_left'] === null) {
         $planBilling['notice_tone'] = 'ok';
         $planBilling['notice_title'] = 'Plan pagado al dia';
-        $planBilling['notice_text'] = 'Tu cuenta esta pagada. El pago de renovacion queda bloqueado para evitar cobros duplicados.';
+        $planBilling['notice_text'] = 'Tu cuenta ' . strtolower($planBilling['billing_cycle_name']) . ' esta pagada. El pago de renovacion queda bloqueado para evitar cobros duplicados.';
       } elseif ($planBilling['days_left'] < 0) {
         $planBilling['notice_tone'] = 'danger';
         $planBilling['notice_title'] = 'Renovacion vencida';
-        $planBilling['notice_text'] = 'Tu ciclo esta vencido hace ' . abs((int)$planBilling['days_left']) . ' dias. Regulariza para evitar suspension.';
+        $planBilling['notice_text'] = 'Tu plan ' . strtolower($planBilling['billing_cycle_name']) . ' esta vencido hace ' . abs((int)$planBilling['days_left']) . ' dias. Regulariza para evitar suspension.';
       } elseif ($planBilling['days_left'] <= 7) {
         $planBilling['notice_tone'] = 'warn';
         $planBilling['notice_title'] = 'Renovacion proxima';
-        $planBilling['notice_text'] = 'Quedan ' . (int)$planBilling['days_left'] . ' dias para renovar tu plan.';
+        $planBilling['notice_text'] = 'Quedan ' . (int)$planBilling['days_left'] . ' dias para renovar tu plan ' . strtolower($planBilling['billing_cycle_name']) . '.';
       } else {
         $planBilling['notice_tone'] = 'ok';
         $planBilling['notice_title'] = 'Plan pagado al dia';
-        $planBilling['notice_text'] = 'Tu proxima renovacion vence en ' . (int)$planBilling['days_left'] . ' dias.';
+        $planBilling['notice_text'] = 'Tu plan ' . strtolower($planBilling['billing_cycle_name']) . ' vence en ' . (int)$planBilling['days_left'] . ' dias.';
       }
     } else {
       $planBilling['notice_tone'] = 'warn';
@@ -3200,6 +3226,10 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
               <div class="dash-pill">
                 <span class="dash-pill-k">Estado pago</span>
                 <span class="dash-pill-v"><?= h($planBilling['payment_status'] === 'paid' ? 'Pagado' : 'Pendiente') ?></span>
+              </div>
+              <div class="dash-pill">
+                <span class="dash-pill-k">Modalidad</span>
+                <span class="dash-pill-v"><?= h($planBilling['billing_cycle_name']) ?></span>
               </div>
               <div class="dash-pill">
                 <span class="dash-pill-k">Renovacion</span>

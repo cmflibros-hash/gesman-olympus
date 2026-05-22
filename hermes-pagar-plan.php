@@ -138,9 +138,9 @@ function plan_display_name($planCode)
 function default_plan_prices_clp()
 {
     return [
-        'basico' => 350,
-        'pro' => 990,
-        'enterprise' => 1990,
+        'basico' => ['monthly' => 350, 'annual' => 3500],
+        'pro' => ['monthly' => 990, 'annual' => 9900],
+        'enterprise' => ['monthly' => 1990, 'annual' => 19900],
     ];
 }
 
@@ -154,6 +154,8 @@ $view = [
     'payer_email' => '',
     'plan_name' => 'Basico',
     'plan_code' => 'basico',
+    'billing_cycle' => 'monthly',
+    'billing_cycle_name' => 'Mensual',
     'amount' => '350',
     'currency_id' => 'CLP',
 ];
@@ -232,6 +234,8 @@ if ($view['error'] === '') {
                 id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                 plan_code VARCHAR(40) NOT NULL,
                 amount_clp INT UNSIGNED NOT NULL DEFAULT 350,
+                monthly_amount_clp INT UNSIGNED NOT NULL DEFAULT 350,
+                annual_amount_clp INT UNSIGNED NOT NULL DEFAULT 3500,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 UNIQUE KEY uq_plan_pricing_code (plan_code)
@@ -239,28 +243,33 @@ if ($view['error'] === '') {
         );
 
         $seedPlanPrice = $pdo->prepare(
-            'INSERT INTO plan_pricing (plan_code, amount_clp)
-             VALUES (:plan_code, :amount_clp)
+            'INSERT INTO plan_pricing (plan_code, amount_clp, monthly_amount_clp, annual_amount_clp)
+             VALUES (:plan_code, :amount_clp, :monthly_amount_clp, :annual_amount_clp)
              ON DUPLICATE KEY UPDATE plan_code = plan_code'
         );
-        foreach (default_plan_prices_clp() as $seedPlanCode => $seedAmount) {
+        foreach (default_plan_prices_clp() as $seedPlanCode => $seedCfg) {
             $seedPlanPrice->execute([
                 'plan_code' => $seedPlanCode,
-                'amount_clp' => (int)$seedAmount,
+                'amount_clp' => (int)($seedCfg['monthly'] ?? 350),
+                'monthly_amount_clp' => (int)($seedCfg['monthly'] ?? 350),
+                'annual_amount_clp' => (int)($seedCfg['annual'] ?? 3500),
             ]);
         }
 
         ensure_column($pdo, 'account_signups', 'payment_status', 'VARCHAR(20) NOT NULL DEFAULT "unpaid"');
         ensure_column($pdo, 'account_signups', 'plan_code', 'VARCHAR(40) NOT NULL DEFAULT "basico"');
+        ensure_column($pdo, 'account_signups', 'billing_cycle', 'VARCHAR(20) NOT NULL DEFAULT "monthly"');
         ensure_column($pdo, 'account_signups', 'payment_access_token', 'CHAR(64) NULL');
         ensure_column($pdo, 'account_signups', 'payment_access_expires_at', 'DATETIME NULL');
         ensure_column($pdo, 'account_signups', 'tenant_company_id', 'BIGINT UNSIGNED NULL');
         ensure_column($pdo, 'account_signups', 'activated_at', 'DATETIME NULL');
+        ensure_column($pdo, 'plan_pricing', 'monthly_amount_clp', 'INT UNSIGNED NOT NULL DEFAULT 350');
+        ensure_column($pdo, 'plan_pricing', 'annual_amount_clp', 'INT UNSIGNED NOT NULL DEFAULT 3500');
         ensure_column($pdo, 'payment_method_settings', 'public_key_enc', 'TEXT NULL');
         ensure_column($pdo, 'payment_method_settings', 'access_token_enc', 'TEXT NULL');
 
         $stSignup = $pdo->prepare(
-            'SELECT id, email, company_name, status, payment_status, plan_code, email_verified_at, payment_access_expires_at
+            'SELECT id, email, company_name, status, payment_status, plan_code, billing_cycle, email_verified_at, payment_access_expires_at
              FROM account_signups
              WHERE payment_access_token = :payment_access_token
              LIMIT 1'
@@ -281,13 +290,28 @@ if ($view['error'] === '') {
                 if (!in_array($planCode, ['basico', 'pro', 'enterprise'], true)) {
                     $planCode = 'basico';
                 }
+                $billingCycle = strtolower(trim((string)($signup['billing_cycle'] ?? 'monthly')));
+                if (!in_array($billingCycle, ['monthly', 'annual'], true)) {
+                    $billingCycle = 'monthly';
+                }
 
-                $stPlanPrice = $pdo->prepare('SELECT amount_clp FROM plan_pricing WHERE plan_code = :plan_code LIMIT 1');
+                $stPlanPrice = $pdo->prepare('SELECT amount_clp, monthly_amount_clp, annual_amount_clp FROM plan_pricing WHERE plan_code = :plan_code LIMIT 1');
                 $stPlanPrice->execute(['plan_code' => $planCode]);
-                $amountByPlan = (int)$stPlanPrice->fetchColumn();
+                $priceRow = $stPlanPrice->fetch();
+                $amountByPlan = 0;
+                if ($priceRow) {
+                    if ($billingCycle === 'annual') {
+                        $amountByPlan = (int)($priceRow['annual_amount_clp'] ?? 0);
+                    } else {
+                        $amountByPlan = (int)($priceRow['monthly_amount_clp'] ?? 0);
+                    }
+                    if ($amountByPlan < 350) {
+                        $amountByPlan = (int)($priceRow['amount_clp'] ?? 0);
+                    }
+                }
                 if ($amountByPlan < 350) {
                     $defaults = default_plan_prices_clp();
-                    $amountByPlan = (int)($defaults[$planCode] ?? 350);
+                    $amountByPlan = (int)(($defaults[$planCode][$billingCycle] ?? 350));
                 }
 
                 $view['ok'] = true;
@@ -298,6 +322,8 @@ if ($view['error'] === '') {
                 $view['payment_status'] = (string)$signup['payment_status'];
                 $view['plan_code'] = $planCode;
                 $view['plan_name'] = plan_display_name($planCode);
+                $view['billing_cycle'] = $billingCycle;
+                $view['billing_cycle_name'] = ($billingCycle === 'annual') ? 'Anual' : 'Mensual';
                 $view['amount'] = (string)$amountByPlan;
             }
         }
@@ -405,7 +431,7 @@ if ($view['error'] === '') {
 
                     $payload = [
                         'commerceOrder' => $commerceOrder,
-                        'subject' => 'Plan ' . $view['plan_name'] . ' GesMan HERMES',
+                        'subject' => 'Plan ' . $view['plan_name'] . ' ' . $view['billing_cycle_name'] . ' GesMan HERMES',
                         'currency' => 'CLP',
                         'amount' => (int)round((float)$view['amount']),
                         'email' => $payerEmail,
@@ -585,6 +611,7 @@ if ($view['error'] === '') {
         <p><strong>Empresa:</strong> <?= h($view['company_name']) ?></p>
         <p><strong>Correo:</strong> <?= h($view['email']) ?></p>
         <p><strong>Plan:</strong> <?= h($view['plan_name']) ?></p>
+        <p><strong>Modalidad:</strong> <?= h($view['billing_cycle_name']) ?></p>
         <p><strong>Monto:</strong> <?= h($view['amount']) ?> <?= h($view['currency_id']) ?></p>
         <ul class="list">
           <li>Acceso habilitado solo al confirmar pago aprobado.</li>
