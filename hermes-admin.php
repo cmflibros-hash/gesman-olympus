@@ -77,6 +77,15 @@ function plan_name($plan)
     return 'Basico';
 }
 
+  function default_plan_prices_clp()
+  {
+    return [
+      'basico' => 350,
+      'pro' => 990,
+      'enterprise' => 1990,
+    ];
+  }
+
 function load_secure_mp_credentials()
 {
   $path = __DIR__ . '/.flow_credentials.php';
@@ -195,6 +204,7 @@ $planCatalog = [
 ];
 
 $flash = ['type' => '', 'message' => ''];
+$planPricing = default_plan_prices_clp();
 $stats = [
     'signups_total' => 0,
     'email_ok' => 0,
@@ -277,6 +287,17 @@ try {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
     );
 
+      $pdo->exec(
+        'CREATE TABLE IF NOT EXISTS plan_pricing (
+          id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+          plan_code VARCHAR(40) NOT NULL,
+          amount_clp INT UNSIGNED NOT NULL DEFAULT 350,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          UNIQUE KEY uq_plan_pricing_code (plan_code)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+      );
+
     $pdo->exec(
         'CREATE TABLE IF NOT EXISTS payment_method_settings (
             id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -345,6 +366,18 @@ try {
          WHERE status = "active"
            AND plan_status = "pending_payment"'
       );
+
+      $seedPlanPrice = $pdo->prepare(
+        'INSERT INTO plan_pricing (plan_code, amount_clp)
+         VALUES (:plan_code, :amount_clp)
+         ON DUPLICATE KEY UPDATE plan_code = plan_code'
+      );
+      foreach (default_plan_prices_clp() as $seedPlanCode => $seedAmount) {
+        $seedPlanPrice->execute([
+          'plan_code' => $seedPlanCode,
+          'amount_clp' => (int)$seedAmount,
+        ]);
+      }
 
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $action = (string)$_POST['action'];
@@ -534,6 +567,29 @@ try {
             $module = 'planes';
         }
 
+          if ($action === 'save_plan_pricing') {
+            $upPrice = $pdo->prepare(
+              'INSERT INTO plan_pricing (plan_code, amount_clp)
+               VALUES (:plan_code, :amount_clp)
+               ON DUPLICATE KEY UPDATE amount_clp = VALUES(amount_clp)'
+            );
+
+            foreach (array_keys($planCatalog) as $planCode) {
+              $raw = (string)($_POST['price_' . $planCode] ?? '');
+              $amount = (int)preg_replace('/[^0-9]/', '', $raw);
+              if ($amount < 350) {
+                $amount = 350;
+              }
+              $upPrice->execute([
+                'plan_code' => $planCode,
+                'amount_clp' => $amount,
+              ]);
+            }
+
+            $flash = ['type' => 'ok', 'message' => 'Valores de planes actualizados correctamente.'];
+            $module = 'planes';
+          }
+
         if ($action === 'save_flow') {
             $isEnabled = isset($_POST['is_enabled']) ? 1 : 0;
             $environment = (string)($_POST['environment'] ?? 'sandbox');
@@ -637,6 +693,14 @@ try {
          ORDER BY id DESC
          LIMIT 120'
     )->fetchAll();
+
+    $priceRows = $pdo->query('SELECT plan_code, amount_clp FROM plan_pricing')->fetchAll();
+    foreach ($priceRows as $rowPrice) {
+      $code = strtolower(trim((string)($rowPrice['plan_code'] ?? '')));
+      if (isset($planCatalog[$code])) {
+        $planPricing[$code] = max(350, (int)($rowPrice['amount_clp'] ?? 350));
+      }
+    }
 
     $stPayment = $pdo->prepare(
       'SELECT is_enabled, environment, public_key, access_token, public_key_enc, access_token_enc, webhook_url
@@ -933,6 +997,7 @@ try {
         <section class="panel">
           <h2>Onboarding: verificacion y cobro</h2>
           <p class="muted">Aqui controlas cuentas registradas, estado de email, pago y activacion de tenant.</p>
+          <p class="muted">El boton <strong>Activar tenant</strong> crea (o actualiza) el tenant productivo de la empresa, habilita acceso e integra el plan pagado en su cuenta.</p>
           <table>
             <thead>
               <tr>
@@ -984,7 +1049,7 @@ try {
                           <form method="post">
                             <input type="hidden" name="action" value="activate_signup">
                             <input type="hidden" name="signup_id" value="<?= (int)$s['id'] ?>">
-                            <button class="btn small" type="submit">Activar tenant</button>
+                            <button class="btn small" type="submit" title="Crea/actualiza tenant, habilita acceso y marca la cuenta lista para uso">Activar tenant</button>
                           </form>
                         <?php endif; ?>
                       </div>
@@ -1042,6 +1107,7 @@ try {
             <?php foreach ($planCatalog as $key => $plan): ?>
               <article class="card">
                 <div class="label">Plan <?= h($plan['name']) ?></div>
+                <div class="kpi" style="font-size:1.05rem;">$<?= h(number_format((int)($planPricing[$key] ?? 350), 0, ',', '.')) ?> CLP</div>
                 <ul class="stack">
                   <?php foreach ($plan['features'] as $feature): ?>
                     <li><?= h($feature) ?></li>
@@ -1050,6 +1116,42 @@ try {
               </article>
             <?php endforeach; ?>
           </div>
+        </section>
+
+        <section class="panel">
+          <h2>Valores comerciales por plan</h2>
+          <p class="muted">Define aqui el monto base en CLP que se usara para checkout de onboarding/renovacion segun plan. Minimo permitido: $350 CLP.</p>
+          <form method="post" autocomplete="off">
+            <input type="hidden" name="action" value="save_plan_pricing">
+            <table>
+              <thead>
+                <tr>
+                  <th>Plan</th>
+                  <th>Valor (CLP)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <?php foreach ($planCatalog as $key => $plan): ?>
+                  <tr>
+                    <td><?= h($plan['name']) ?></td>
+                    <td>
+                      <input
+                        type="number"
+                        min="350"
+                        step="1"
+                        name="price_<?= h($key) ?>"
+                        value="<?= h((string)((int)($planPricing[$key] ?? 350))) ?>"
+                        style="max-width:180px;"
+                        required>
+                    </td>
+                  </tr>
+                <?php endforeach; ?>
+              </tbody>
+            </table>
+            <div class="actions" style="margin-top:.75rem;">
+              <button class="btn" type="submit">Guardar valores</button>
+            </div>
+          </form>
         </section>
 
         <section class="panel">

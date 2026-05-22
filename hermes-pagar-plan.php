@@ -123,6 +123,27 @@ function flow_request($method, $endpoint, $apiKey, $secretKey, array $params, $e
     return ['ok' => $httpCode >= 200 && $httpCode < 300, 'http_code' => $httpCode, 'error' => $curlError, 'data' => $data, 'raw' => $raw];
 }
 
+function plan_display_name($planCode)
+{
+    $code = strtolower(trim((string)$planCode));
+    if ($code === 'pro') {
+        return 'Pro';
+    }
+    if ($code === 'enterprise') {
+        return 'Enterprise';
+    }
+    return 'Basico';
+}
+
+function default_plan_prices_clp()
+{
+    return [
+        'basico' => 350,
+        'pro' => 990,
+        'enterprise' => 1990,
+    ];
+}
+
 $view = [
     'ok' => false,
     'error' => '',
@@ -131,6 +152,7 @@ $view = [
     'status' => '',
     'payment_status' => '',
     'payer_email' => '',
+    'plan_name' => 'Basico',
     'plan_code' => 'basico',
     'amount' => '350',
     'currency_id' => 'CLP',
@@ -205,6 +227,29 @@ if ($view['error'] === '') {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
         );
 
+        $pdo->exec(
+            'CREATE TABLE IF NOT EXISTS plan_pricing (
+                id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                plan_code VARCHAR(40) NOT NULL,
+                amount_clp INT UNSIGNED NOT NULL DEFAULT 350,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_plan_pricing_code (plan_code)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+        );
+
+        $seedPlanPrice = $pdo->prepare(
+            'INSERT INTO plan_pricing (plan_code, amount_clp)
+             VALUES (:plan_code, :amount_clp)
+             ON DUPLICATE KEY UPDATE plan_code = plan_code'
+        );
+        foreach (default_plan_prices_clp() as $seedPlanCode => $seedAmount) {
+            $seedPlanPrice->execute([
+                'plan_code' => $seedPlanCode,
+                'amount_clp' => (int)$seedAmount,
+            ]);
+        }
+
         ensure_column($pdo, 'account_signups', 'payment_status', 'VARCHAR(20) NOT NULL DEFAULT "unpaid"');
         ensure_column($pdo, 'account_signups', 'plan_code', 'VARCHAR(40) NOT NULL DEFAULT "basico"');
         ensure_column($pdo, 'account_signups', 'payment_access_token', 'CHAR(64) NULL');
@@ -232,13 +277,28 @@ if ($view['error'] === '') {
             } elseif (empty($signup['email_verified_at'])) {
                 $view['error'] = 'Tu correo aun no esta verificado. Verifica el correo antes de pagar.';
             } else {
+                $planCode = strtolower(trim((string)$signup['plan_code']));
+                if (!in_array($planCode, ['basico', 'pro', 'enterprise'], true)) {
+                    $planCode = 'basico';
+                }
+
+                $stPlanPrice = $pdo->prepare('SELECT amount_clp FROM plan_pricing WHERE plan_code = :plan_code LIMIT 1');
+                $stPlanPrice->execute(['plan_code' => $planCode]);
+                $amountByPlan = (int)$stPlanPrice->fetchColumn();
+                if ($amountByPlan < 350) {
+                    $defaults = default_plan_prices_clp();
+                    $amountByPlan = (int)($defaults[$planCode] ?? 350);
+                }
+
                 $view['ok'] = true;
                 $view['company_name'] = (string)$signup['company_name'];
                 $view['email'] = (string)$signup['email'];
                 $view['payer_email'] = (string)$signup['email'];
                 $view['status'] = (string)$signup['status'];
                 $view['payment_status'] = (string)$signup['payment_status'];
-                $view['plan_code'] = (string)$signup['plan_code'];
+                $view['plan_code'] = $planCode;
+                $view['plan_name'] = plan_display_name($planCode);
+                $view['amount'] = (string)$amountByPlan;
             }
         }
 
@@ -345,7 +405,7 @@ if ($view['error'] === '') {
 
                     $payload = [
                         'commerceOrder' => $commerceOrder,
-                        'subject' => 'Plan Basico GesMan HERMES',
+                        'subject' => 'Plan ' . $view['plan_name'] . ' GesMan HERMES',
                         'currency' => 'CLP',
                         'amount' => (int)round((float)$view['amount']),
                         'email' => $payerEmail,
@@ -411,8 +471,8 @@ if ($view['error'] === '') {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Pagar plan basico | GesMan HERMES</title>
-  <meta name="description" content="Checkout de validacion para plan basico de GesMan HERMES.">
+    <title>Pagar plan | GesMan HERMES</title>
+    <meta name="description" content="Checkout de validacion del plan empresarial de GesMan HERMES.">
   <link rel="icon" type="image/svg+xml" href="/assets/img/favicon-hermes.svg">
   <style>
     :root {
@@ -513,8 +573,8 @@ if ($view['error'] === '') {
 </head>
 <body>
   <main class="card">
-    <h1>Pagar plan basico de validacion</h1>
-    <p>Este pago de $350 CLP permite validar el flujo real de onboarding y activacion con resguardos de seguridad.</p>
+        <h1>Pagar plan <?= h($view['plan_name']) ?></h1>
+        <p>Este pago permite validar el flujo real de onboarding y activacion con resguardos de seguridad.</p>
 
     <?php if ($view['error'] !== ''): ?>
       <div class="msg err"><?= h($view['error']) ?></div>
@@ -524,7 +584,7 @@ if ($view['error'] === '') {
       <div class="summary">
         <p><strong>Empresa:</strong> <?= h($view['company_name']) ?></p>
         <p><strong>Correo:</strong> <?= h($view['email']) ?></p>
-        <p><strong>Plan:</strong> Basico</p>
+        <p><strong>Plan:</strong> <?= h($view['plan_name']) ?></p>
         <p><strong>Monto:</strong> <?= h($view['amount']) ?> <?= h($view['currency_id']) ?></p>
         <ul class="list">
           <li>Acceso habilitado solo al confirmar pago aprobado.</li>
