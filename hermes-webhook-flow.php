@@ -108,11 +108,11 @@ function flow_sign(array $params, $secretKey)
 {
     unset($params['s']);
     ksort($params, SORT_STRING);
-    $pairs = [];
+    $toSign = '';
     foreach ($params as $k => $v) {
-        $pairs[] = (string)$k . '=' . rawurlencode((string)$v);
+        $toSign .= (string)$k . (string)$v;
     }
-    return hash_hmac('sha256', implode('&', $pairs), (string)$secretKey);
+    return hash_hmac('sha256', $toSign, (string)$secretKey);
 }
 
 function flow_request($method, $endpoint, $apiKey, $secretKey, array $params, $environment)

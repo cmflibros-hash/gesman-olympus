@@ -77,11 +77,10 @@ function flow_sign(array $params, $secretKey)
 {
     unset($params['s']);
     ksort($params, SORT_STRING);
-    $pairs = [];
+    $toSign = '';
     foreach ($params as $k => $v) {
-        $pairs[] = (string)$k . '=' . rawurlencode((string)$v);
+        $toSign .= (string)$k . (string)$v;
     }
-    $toSign = implode('&', $pairs);
     return hash_hmac('sha256', $toSign, (string)$secretKey);
 }
 
