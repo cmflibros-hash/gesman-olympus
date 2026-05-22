@@ -248,6 +248,15 @@ if ($view['error'] === '') {
                 exit;
             }
 
+            // Revalida contra DB para bloquear doble pago si la cuenta ya se marco como pagada entre solicitudes.
+            $stFreshSignup = $pdo->prepare('SELECT payment_status FROM account_signups WHERE id = :id LIMIT 1');
+            $stFreshSignup->execute(['id' => (int)$signup['id']]);
+            $freshPaymentStatus = strtolower(trim((string)$stFreshSignup->fetchColumn()));
+            if ($freshPaymentStatus === 'paid') {
+                header('Location: /pago-resultado/?s=ok');
+                exit;
+            }
+
             $stPay = $pdo->prepare(
                 'SELECT is_enabled, environment, public_key, access_token, public_key_enc, access_token_enc, webhook_url
                  FROM payment_method_settings
