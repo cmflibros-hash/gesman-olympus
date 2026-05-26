@@ -1,13 +1,15 @@
 <?php
-session_start();
+require_once __DIR__ . '/security-helpers.php';
+security_start_session();
+security_apply_web_headers();
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['logout'])) {
-    $_SESSION = [];
-    if (ini_get('session.use_cookies')) {
-        $params = session_get_cookie_params();
-        setcookie(session_name(), '', time() - 42000, $params['path'], $params['domain'], $params['secure'], $params['httponly']);
-    }
-    session_destroy();
+  if (!security_validate_csrf($_POST['csrf_token'] ?? '')) {
+    http_response_code(403);
+    echo 'Solicitud no valida (CSRF).';
+    exit;
+  }
+    security_logout_session();
     header('Location: /login/');
     exit;
 }
@@ -23,10 +25,40 @@ if (!in_array($role, ['company_owner', 'company_admin', 'company_user'], true)) 
     exit;
 }
 
+$sessionIdleTimeoutSeconds = 20 * 60;
+$sessionWarningSeconds = 5 * 60;
+$sessionActivity = security_session_activity_status($sessionIdleTimeoutSeconds);
+if ($sessionActivity['expired']) {
+  security_logout_session();
+  if (isset($_GET['keepalive']) && (string)$_GET['keepalive'] === '1') {
+    http_response_code(401);
+    header('Content-Type: application/json; charset=UTF-8');
+    echo json_encode(['ok' => false, 'expired' => true], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+  }
+  header('Location: /login/?session_timeout=1');
+  exit;
+}
+
+if (isset($_GET['keepalive']) && (string)$_GET['keepalive'] === '1') {
+  header('Content-Type: application/json; charset=UTF-8');
+  echo json_encode([
+    'ok' => true,
+    'expires_at' => (int)$sessionActivity['expires_at'],
+    'idle_timeout_seconds' => $sessionIdleTimeoutSeconds,
+    'warning_seconds' => $sessionWarningSeconds,
+  ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+  exit;
+}
+
+$sessionExpiresAt = (int)$sessionActivity['expires_at'];
+
 $module = (string)($_GET['module'] ?? 'dashboard');
-if (!in_array($module, ['dashboard', 'empresa', 'clientes', 'cotizaciones'], true)) {
+if (!in_array($module, ['dashboard', 'plan', 'empresa', 'clientes', 'cotizaciones', 'papelera', 'configuracion'], true)) {
     $module = 'dashboard';
 }
+
+$csrfToken = security_csrf_token();
 
 function h($value)
 {
@@ -53,6 +85,390 @@ function column_exists(PDO $pdo, $table, $column)
     );
     $st->execute(['t' => $table, 'c' => $column]);
     return (bool)$st->fetchColumn();
+}
+
+function table_exists(PDO $pdo, $table)
+{
+    $st = $pdo->prepare(
+        'SELECT 1 FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t LIMIT 1'
+    );
+    $st->execute(['t' => $table]);
+    return (bool)$st->fetchColumn();
+}
+
+function smtp_read_response($socket)
+{
+  $response = '';
+  while (!feof($socket)) {
+    $line = fgets($socket, 515);
+    if ($line === false) {
+      break;
+    }
+    $response .= $line;
+    if (preg_match('/^\d{3} /', $line) === 1) {
+      break;
+    }
+  }
+  return $response;
+}
+
+function smtp_expect_code($response, $acceptedCodes)
+{
+  if (!preg_match('/^(\d{3})/m', (string)$response, $m)) {
+    return false;
+  }
+  return in_array((int)$m[1], $acceptedCodes, true);
+}
+
+function smtp_send_command($socket, $command, $acceptedCodes)
+{
+  fwrite($socket, $command . "\r\n");
+  $response = smtp_read_response($socket);
+  return smtp_expect_code($response, $acceptedCodes);
+}
+
+function load_mail_credentials()
+{
+  $path = __DIR__ . '/.mail_credentials.php';
+  if (!is_file($path)) {
+    return null;
+  }
+
+  $cfg = require $path;
+  if (!is_array($cfg)) {
+    return null;
+  }
+
+  $required = ['host', 'port', 'username', 'password', 'from_email'];
+  foreach ($required as $key) {
+    if (empty($cfg[$key])) {
+      return null;
+    }
+  }
+
+  if (empty($cfg['from_name'])) {
+    $cfg['from_name'] = 'GesMan HERMES';
+  }
+
+  return $cfg;
+}
+
+function send_password_recovery_email_smtp($mailCfg, $toEmail, $toName, $resetLink)
+{
+  $host = (string)$mailCfg['host'];
+  $port = (int)$mailCfg['port'];
+  $username = (string)$mailCfg['username'];
+  $password = (string)$mailCfg['password'];
+  $fromEmail = (string)$mailCfg['from_email'];
+  $fromName = (string)($mailCfg['from_name'] ?? 'GesMan HERMES');
+  $secure = strtolower(trim((string)($mailCfg['secure'] ?? 'ssl')));
+
+  $transport = ($secure === 'ssl' || $secure === 'tls') ? ($secure . '://') : '';
+  $socket = @fsockopen($transport . $host, $port, $errno, $errstr, 20);
+  if (!$socket) {
+    return false;
+  }
+
+  stream_set_timeout($socket, 20);
+
+  $helloResponse = smtp_read_response($socket);
+  if (!smtp_expect_code($helloResponse, [220])) {
+    fclose($socket);
+    return false;
+  }
+
+  $serverName = $_SERVER['SERVER_NAME'] ?? 'localhost';
+  if (!smtp_send_command($socket, 'EHLO ' . $serverName, [250])) {
+    fclose($socket);
+    return false;
+  }
+  if (!smtp_send_command($socket, 'AUTH LOGIN', [334])) {
+    fclose($socket);
+    return false;
+  }
+  if (!smtp_send_command($socket, base64_encode($username), [334])) {
+    fclose($socket);
+    return false;
+  }
+  if (!smtp_send_command($socket, base64_encode($password), [235])) {
+    fclose($socket);
+    return false;
+  }
+  if (!smtp_send_command($socket, 'MAIL FROM:<' . $fromEmail . '>', [250])) {
+    fclose($socket);
+    return false;
+  }
+  if (!smtp_send_command($socket, 'RCPT TO:<' . $toEmail . '>', [250, 251])) {
+    fclose($socket);
+    return false;
+  }
+  if (!smtp_send_command($socket, 'DATA', [354])) {
+    fclose($socket);
+    return false;
+  }
+
+  $safeToName = str_replace(["\r", "\n"], '', (string)$toName);
+  $safeFromName = str_replace(["\r", "\n"], '', (string)$fromName);
+  $subject = 'Recuperacion de clave en GesMan HERMES';
+  $body = "Hola {$safeToName},\n\n" .
+    "Recibimos una solicitud para cambiar tu clave de acceso.\n" .
+    "Usa este enlace para crear una nueva clave (expira en 60 minutos):\n\n" .
+    $resetLink . "\n\n" .
+    "Si no solicitaste este cambio, ignora este correo.\n";
+
+  $headers = [
+    'Date: ' . date(DATE_RFC2822),
+    'From: ' . $safeFromName . ' <' . $fromEmail . '>',
+    'To: ' . $safeToName . ' <' . $toEmail . '>',
+    'Subject: ' . $subject,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: 8bit',
+  ];
+
+  $payload = implode("\r\n", $headers) . "\r\n\r\n" . $body . "\r\n.\r\n";
+  fwrite($socket, $payload);
+
+  $dataResponse = smtp_read_response($socket);
+  if (!smtp_expect_code($dataResponse, [250])) {
+    fclose($socket);
+    return false;
+  }
+
+  smtp_send_command($socket, 'QUIT', [221]);
+  fclose($socket);
+  return true;
+}
+
+function sanitize_email_header_value($value)
+{
+  return trim(str_replace(["\r", "\n"], '', (string)$value));
+}
+
+function parse_email_list($raw, $max = 10)
+{
+  $tokens = [];
+  if (is_array($raw)) {
+    $tokens = $raw;
+  } else {
+    $tokens = preg_split('/[;,\n\r]+/', (string)$raw) ?: [];
+  }
+
+  $emails = [];
+  foreach ($tokens as $token) {
+    $email = strtolower(trim((string)$token));
+    if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+      continue;
+    }
+    if (!in_array($email, $emails, true)) {
+      $emails[] = $email;
+    }
+    if (count($emails) >= (int)$max) {
+      break;
+    }
+  }
+  return $emails;
+}
+
+function sanitize_attachment_name($name, $fallback = 'adjunto.bin')
+{
+  $clean = preg_replace('/[^A-Za-z0-9._-]+/', '_', (string)$name);
+  $clean = trim((string)$clean, '._-');
+  if ($clean === '') {
+    $clean = $fallback;
+  }
+  return substr($clean, 0, 120);
+}
+
+function smtp_send_data_payload($socket, $payload)
+{
+  $data = str_replace(["\r\n", "\r"], "\n", (string)$payload);
+  $data = preg_replace('/\n\./', "\n..", $data);
+  $data = str_replace("\n", "\r\n", (string)$data);
+  fwrite($socket, $data . "\r\n.\r\n");
+  $response = smtp_read_response($socket);
+  return smtp_expect_code($response, [250]);
+}
+
+function build_quote_html_attachment($companyName, $previewUrl, array $quoteRow, array $quoteItems)
+{
+  $quoteNumber = (string)($quoteRow['numero_cotizacion'] ?? '');
+  $customerName = (string)($quoteRow['customer_name'] ?? '');
+  $dateIssued = (string)($quoteRow['fecha_emision'] ?? '');
+  $state = (string)($quoteRow['estado'] ?? '');
+  $total = number_format((float)($quoteRow['total'] ?? 0), 0, ',', '.');
+  $safeCompany = htmlspecialchars($companyName !== '' ? $companyName : 'GesMan HERMES', ENT_QUOTES, 'UTF-8');
+  $safeNumber = htmlspecialchars($quoteNumber, ENT_QUOTES, 'UTF-8');
+  $safeCustomer = htmlspecialchars($customerName, ENT_QUOTES, 'UTF-8');
+  $safeDate = htmlspecialchars($dateIssued, ENT_QUOTES, 'UTF-8');
+  $safeState = htmlspecialchars($state, ENT_QUOTES, 'UTF-8');
+  $safeTotal = htmlspecialchars($total, ENT_QUOTES, 'UTF-8');
+  $safeUrl = htmlspecialchars($previewUrl, ENT_QUOTES, 'UTF-8');
+
+  $rows = '';
+  foreach ($quoteItems as $it) {
+    $itemType = strtolower(trim((string)($it['item_type'] ?? 'normal')));
+    $isText = ($itemType === 'text');
+    $desc = htmlspecialchars((string)($it['descripcion'] ?? ''), ENT_QUOTES, 'UTF-8');
+    $qty = $isText ? '-' : htmlspecialchars((string)($it['cantidad'] ?? ''), ENT_QUOTES, 'UTF-8');
+    $price = $isText ? '-' : '$' . number_format((float)($it['precio_unitario'] ?? 0), 0, ',', '.');
+    $lineTotal = $isText ? '-' : '$' . number_format((float)($it['total_linea'] ?? 0), 0, ',', '.');
+    $rows .= '<tr>'
+      . '<td style="border:1px solid #d4d8e0;padding:7px;">' . $desc . '</td>'
+      . '<td style="border:1px solid #d4d8e0;padding:7px;text-align:center;">' . $qty . '</td>'
+      . '<td style="border:1px solid #d4d8e0;padding:7px;text-align:right;">' . htmlspecialchars($price, ENT_QUOTES, 'UTF-8') . '</td>'
+      . '<td style="border:1px solid #d4d8e0;padding:7px;text-align:right;">' . htmlspecialchars($lineTotal, ENT_QUOTES, 'UTF-8') . '</td>'
+      . '</tr>';
+  }
+  if ($rows === '') {
+    $rows = '<tr><td colspan="4" style="border:1px solid #d4d8e0;padding:8px;">Sin items</td></tr>';
+  }
+
+  $html = '<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Cotizacion ' . $safeNumber . '</title></head><body style="font-family:Segoe UI,Arial,sans-serif;color:#0f172a;">'
+    . '<h2 style="margin:0 0 8px;">' . $safeCompany . ' - Cotizacion ' . $safeNumber . '</h2>'
+    . '<p style="margin:0 0 12px;">Cliente: <strong>' . $safeCustomer . '</strong> | Fecha: ' . $safeDate . ' | Estado: ' . $safeState . '</p>'
+    . '<table style="border-collapse:collapse;width:100%;font-size:13px;">'
+    . '<thead><tr>'
+    . '<th style="border:1px solid #d4d8e0;padding:7px;background:#eef3ff;text-align:left;">Descripcion</th>'
+    . '<th style="border:1px solid #d4d8e0;padding:7px;background:#eef3ff;text-align:center;">Cantidad</th>'
+    . '<th style="border:1px solid #d4d8e0;padding:7px;background:#eef3ff;text-align:right;">Precio</th>'
+    . '<th style="border:1px solid #d4d8e0;padding:7px;background:#eef3ff;text-align:right;">Total</th>'
+    . '</tr></thead><tbody>' . $rows . '</tbody></table>'
+    . '<p style="margin:12px 0 0;">Total: <strong>$' . $safeTotal . '</strong></p>'
+    . '<p style="margin:10px 0 0;">Vista imprimible: <a href="' . $safeUrl . '">' . $safeUrl . '</a></p>'
+    . '</body></html>';
+
+  return [
+    'name' => sanitize_attachment_name('cotizacion-' . ($quoteNumber !== '' ? $quoteNumber : date('Ymd_His')) . '.html', 'cotizacion.html'),
+    'mime' => 'text/html; charset=UTF-8',
+    'content' => $html,
+  ];
+}
+
+function send_quote_email_smtp($mailCfg, array $toList, array $ccList, $subject, $textMessage, $htmlMessage, array $attachments)
+{
+  if (empty($toList)) {
+    return false;
+  }
+
+  $host = (string)$mailCfg['host'];
+  $port = (int)$mailCfg['port'];
+  $username = (string)$mailCfg['username'];
+  $password = (string)$mailCfg['password'];
+  $fromEmail = (string)$mailCfg['from_email'];
+  $fromName = sanitize_email_header_value((string)($mailCfg['from_name'] ?? 'GesMan HERMES'));
+  $secure = strtolower(trim((string)($mailCfg['secure'] ?? 'ssl')));
+
+  $transport = ($secure === 'ssl' || $secure === 'tls') ? ($secure . '://') : '';
+  $socket = @fsockopen($transport . $host, $port, $errno, $errstr, 20);
+  if (!$socket) {
+    return false;
+  }
+  stream_set_timeout($socket, 25);
+
+  $helloResponse = smtp_read_response($socket);
+  if (!smtp_expect_code($helloResponse, [220])) {
+    fclose($socket);
+    return false;
+  }
+
+  $serverName = $_SERVER['SERVER_NAME'] ?? 'localhost';
+  if (!smtp_send_command($socket, 'EHLO ' . $serverName, [250])
+    || !smtp_send_command($socket, 'AUTH LOGIN', [334])
+    || !smtp_send_command($socket, base64_encode($username), [334])
+    || !smtp_send_command($socket, base64_encode($password), [235])
+    || !smtp_send_command($socket, 'MAIL FROM:<' . $fromEmail . '>', [250])) {
+    fclose($socket);
+    return false;
+  }
+
+  $allRecipients = array_values(array_unique(array_merge($toList, $ccList)));
+  foreach ($allRecipients as $recipient) {
+    if (!smtp_send_command($socket, 'RCPT TO:<' . $recipient . '>', [250, 251])) {
+      fclose($socket);
+      return false;
+    }
+  }
+  if (!smtp_send_command($socket, 'DATA', [354])) {
+    fclose($socket);
+    return false;
+  }
+
+  $safeSubject = sanitize_email_header_value($subject !== '' ? $subject : 'Cotizacion GesMan HERMES');
+  $toHeader = implode(', ', $toList);
+  $ccHeader = implode(', ', $ccList);
+  $mixedBoundary = 'mix_' . bin2hex(random_bytes(12));
+  $altBoundary = 'alt_' . bin2hex(random_bytes(12));
+
+  $headers = [
+    'Date: ' . date(DATE_RFC2822),
+    'From: ' . $fromName . ' <' . $fromEmail . '>',
+    'To: ' . $toHeader,
+    'Subject: ' . $safeSubject,
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/mixed; boundary="' . $mixedBoundary . '"',
+  ];
+  if ($ccHeader !== '') {
+    $headers[] = 'Cc: ' . $ccHeader;
+  }
+
+  $textBody = trim((string)$textMessage);
+  if ($textBody === '') {
+    $textBody = 'Adjuntamos y compartimos el detalle de la cotizacion solicitada.';
+  }
+
+  $safeHtml = (string)$htmlMessage;
+  if ($safeHtml === '') {
+    $safeHtml = '<p>Adjuntamos y compartimos el detalle de la cotizacion solicitada.</p>';
+  }
+
+  $body = [];
+  $body[] = '--' . $mixedBoundary;
+  $body[] = 'Content-Type: multipart/alternative; boundary="' . $altBoundary . '"';
+  $body[] = '';
+  $body[] = '--' . $altBoundary;
+  $body[] = 'Content-Type: text/plain; charset=UTF-8';
+  $body[] = 'Content-Transfer-Encoding: 8bit';
+  $body[] = '';
+  $body[] = $textBody;
+  $body[] = '';
+  $body[] = '--' . $altBoundary;
+  $body[] = 'Content-Type: text/html; charset=UTF-8';
+  $body[] = 'Content-Transfer-Encoding: 8bit';
+  $body[] = '';
+  $body[] = $safeHtml;
+  $body[] = '';
+  $body[] = '--' . $altBoundary . '--';
+
+  foreach ($attachments as $attachment) {
+    $name = sanitize_attachment_name((string)($attachment['name'] ?? ''), 'adjunto.bin');
+    $mime = trim((string)($attachment['mime'] ?? 'application/octet-stream'));
+    if ($mime === '') {
+      $mime = 'application/octet-stream';
+    }
+    $content = (string)($attachment['content'] ?? '');
+    if ($content === '') {
+      continue;
+    }
+
+    $body[] = '';
+    $body[] = '--' . $mixedBoundary;
+    $body[] = 'Content-Type: ' . $mime . '; name="' . $name . '"';
+    $body[] = 'Content-Disposition: attachment; filename="' . $name . '"';
+    $body[] = 'Content-Transfer-Encoding: base64';
+    $body[] = '';
+    $body[] = chunk_split(base64_encode($content));
+  }
+
+  $body[] = '';
+  $body[] = '--' . $mixedBoundary . '--';
+
+  $payload = implode("\r\n", $headers) . "\r\n\r\n" . implode("\r\n", $body);
+  $ok = smtp_send_data_payload($socket, $payload);
+  smtp_send_command($socket, 'QUIT', [221, 250]);
+  fclose($socket);
+  return $ok;
 }
 
 function normalize_slug($value)
@@ -124,6 +540,28 @@ function store_logo($file, $tenantCompanyId)
         throw new RuntimeException('Formato no permitido. Usa JPG, PNG o WEBP.');
     }
 
+    $imageInfo = @getimagesize($tmp);
+    if (!is_array($imageInfo) || empty($imageInfo[0]) || empty($imageInfo[1])) {
+      throw new RuntimeException('El archivo subido no es una imagen valida.');
+    }
+
+    $width = (int)$imageInfo[0];
+    $height = (int)$imageInfo[1];
+    if ($width < 32 || $height < 32 || $width > 6000 || $height > 6000) {
+      throw new RuntimeException('El logo debe tener dimensiones validas (entre 32px y 6000px por lado).');
+    }
+
+    $imageType = (int)($imageInfo[2] ?? 0);
+    $typeToMime = [
+      IMAGETYPE_JPEG => 'image/jpeg',
+      IMAGETYPE_PNG => 'image/png',
+      IMAGETYPE_WEBP => 'image/webp',
+    ];
+    $detectedMime = $typeToMime[$imageType] ?? '';
+    if ($detectedMime === '' || $detectedMime !== $mime) {
+      throw new RuntimeException('El archivo no cumple las validaciones de tipo de imagen.');
+    }
+
     $dir = logo_absolute_dir((int)$tenantCompanyId, true);
     $name = 'empresa_' . (int)$tenantCompanyId . '_logo_' . date('Ymd_His') . '_' . bin2hex(random_bytes(4)) . '.' . $ext;
     $path = $dir . DIRECTORY_SEPARATOR . $name;
@@ -172,7 +610,7 @@ function logo_public_url($relativePath)
 
   function dashboard_module_url($module)
   {
-    $safe = in_array($module, ['dashboard', 'empresa', 'clientes', 'cotizaciones'], true) ? $module : 'dashboard';
+    $safe = in_array($module, ['dashboard', 'plan', 'empresa', 'clientes', 'cotizaciones', 'papelera', 'configuracion'], true) ? $module : 'dashboard';
     return '/empresa/dashboard/?module=' . rawurlencode($safe);
   }
 
@@ -188,6 +626,46 @@ function logo_public_url($relativePath)
       return 365;
     }
     return 30;
+  }
+
+  function plan_display_name($planCode)
+  {
+    $code = strtolower(trim((string)$planCode));
+    if ($code === 'pro') {
+      return 'Heroe';
+    }
+    if ($code === 'enterprise') {
+      return 'Semidios';
+    }
+    if ($code === 'olimpico') {
+      return 'Olimpico';
+    }
+    return 'Mortal';
+  }
+
+  function plan_storage_limit_mb($planCode)
+  {
+    $code = strtolower(trim((string)$planCode));
+    if (in_array($code, ['mortal', 'basic', 'basico'], true)) {
+      return 100;
+    }
+    return 1024;
+  }
+
+  function issue_company_payment_token(PDO $pdo, $signupId)
+  {
+    $token = bin2hex(random_bytes(32));
+    $up = $pdo->prepare(
+      'UPDATE account_signups
+       SET payment_access_token = :payment_access_token,
+           payment_access_expires_at = DATE_ADD(NOW(), INTERVAL 72 HOUR)
+       WHERE id = :id'
+    );
+    $up->execute([
+      'payment_access_token' => $token,
+      'id' => (int)$signupId,
+    ]);
+    return $token;
   }
 
   function quote_money_breakdown($subtotal, $descuentoPct)
@@ -249,7 +727,8 @@ $flash = ['ok' => '', 'error' => ''];
 $accountLoginEmail = (string)($_SESSION['hermes_user'] ?? '');
 $companyName = (string)($_SESSION['hermes_company_name'] ?? 'Empresa');
 $companyEmail = (string)($_SESSION['hermes_company_email'] ?? $accountLoginEmail);
-$signupId = (int)($_SESSION['hermes_company_id'] ?? 0);
+$sessionSignupId = (int)($_SESSION['hermes_company_id'] ?? 0);
+$signupId = $sessionSignupId;
 $tenantCompanyId = 0;
 
 $profile = [
@@ -272,13 +751,24 @@ $profile = [
 
 $usage = [
     'plan_code' => 'basico',
-    'storage_limit_mb' => 1024,
+  'storage_limit_mb' => 100,
     'storage_used_mb' => 0,
     'percent' => 0,
 ];
 
 $customers = [];
 $quotes = [];
+$trashCustomers = [];
+$trashQuotes = [];
+$paymentHistoryRows = [];
+$paymentHistoryAvailable = false;
+$accountSettings = [
+  'email' => '',
+  'company_name' => '',
+  'contact_name' => '',
+  'phone' => '',
+  'created_at' => '',
+];
 $quoteItemsByQuote = [];
 $quotePreview = null;
 $quotePreviewItems = [];
@@ -310,10 +800,17 @@ $planBilling = [
   'notice_title' => 'Pago pendiente',
   'notice_text' => 'Tu plan aun no registra pago activo. Regulariza para mantener el acceso operativo.',
   'payment_url' => '',
+  'payment_token' => '',
   'can_pay_renewal' => false,
+];
+$planUpgradeLinks = [
+  'basico' => '',
+  'pro' => '',
+  'enterprise' => '',
 ];
 $openCustomerModal = false;
 $openQuoteModal = false;
+$openQuoteEmailModal = false;
 $customerForm = [
   'id' => '',
   'rut' => '',
@@ -336,18 +833,30 @@ $quoteForm = [
     'validez_dias' => '15',
   'estado' => 'Pendiente',
     'descuento_pct' => '0',
+  'validez_override' => '',
+  'entrega_override' => '',
+  'condicion_de_pago_override' => '',
+  'moneda_override' => '',
   'terminos_condiciones_adicionales' => '',
     'observaciones' => '',
     'items' => [
-        ['descripcion' => '', 'cantidad' => '1', 'precio' => '0'],
+      ['descripcion' => '', 'cantidad' => '1', 'precio' => '0', 'tipo' => 'normal', 'negrita' => '0'],
     ],
+];
+$quoteEmailForm = [
+  'quote_id' => '',
+  'to' => '',
+  'cc' => '',
+  'subject' => '',
+  'message' => "Hola,\n\nTe compartimos la cotizacion solicitada.\n\nQuedo atento a tus comentarios.",
+  'include_quote_attachment' => '1',
 ];
 
   if ($_SERVER['REQUEST_METHOD'] !== 'POST' && isset($_SESSION['hermes_company_postback']) && is_array($_SESSION['hermes_company_postback'])) {
     $postback = $_SESSION['hermes_company_postback'];
     unset($_SESSION['hermes_company_postback']);
 
-    if (isset($postback['module']) && in_array((string)$postback['module'], ['dashboard', 'empresa', 'clientes', 'cotizaciones'], true)) {
+    if (isset($postback['module']) && in_array((string)$postback['module'], ['dashboard', 'plan', 'empresa', 'clientes', 'cotizaciones', 'papelera', 'configuracion'], true)) {
       $module = (string)$postback['module'];
     }
     if (isset($postback['flash']) && is_array($postback['flash'])) {
@@ -356,6 +865,7 @@ $quoteForm = [
     }
     $openCustomerModal = !empty($postback['openCustomerModal']);
     $openQuoteModal = !empty($postback['openQuoteModal']);
+    $openQuoteEmailModal = !empty($postback['openQuoteEmailModal']);
 
     if (isset($postback['customerForm']) && is_array($postback['customerForm'])) {
       $customerForm = array_merge($customerForm, $postback['customerForm']);
@@ -365,6 +875,9 @@ $quoteForm = [
       if (isset($postback['quoteForm']['items']) && is_array($postback['quoteForm']['items'])) {
         $quoteForm['items'] = $postback['quoteForm']['items'];
       }
+    }
+    if (isset($postback['quoteEmailForm']) && is_array($postback['quoteEmailForm'])) {
+      $quoteEmailForm = array_merge($quoteEmailForm, $postback['quoteEmailForm']);
     }
   }
 
@@ -376,7 +889,10 @@ try {
         PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
     ]);
 
-    $pdo->exec('CREATE TABLE IF NOT EXISTS account_signups (
+    security_ensure_tables($pdo);
+
+    if (!table_exists($pdo, 'account_signups')) {
+      $pdo->exec('CREATE TABLE account_signups (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         email VARCHAR(190) NOT NULL,
         company_name VARCHAR(190) NOT NULL,
@@ -394,8 +910,10 @@ try {
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         UNIQUE KEY uq_account_signups_email (email)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    }
 
-    $pdo->exec('CREATE TABLE IF NOT EXISTS tenant_companies (
+    if (!table_exists($pdo, 'tenant_companies')) {
+      $pdo->exec('CREATE TABLE tenant_companies (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         signup_id BIGINT UNSIGNED NULL,
         company_name VARCHAR(190) NOT NULL,
@@ -415,6 +933,7 @@ try {
         UNIQUE KEY uq_tenant_companies_email (owner_email),
         KEY idx_tenant_companies_status (status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    }
 
     if (column_exists($pdo, 'tenant_companies', 'business_email') && column_exists($pdo, 'tenant_companies', 'owner_email')) {
         try {
@@ -424,7 +943,8 @@ try {
         $pdo->exec('UPDATE tenant_companies SET business_email = owner_email WHERE (business_email IS NULL OR business_email = "") AND owner_email IS NOT NULL AND owner_email <> ""');
     }
 
-    $pdo->exec('CREATE TABLE IF NOT EXISTS tenant_company_profiles (
+    if (!table_exists($pdo, 'tenant_company_profiles')) {
+      $pdo->exec('CREATE TABLE tenant_company_profiles (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         tenant_company_id BIGINT UNSIGNED NOT NULL,
         nombre VARCHAR(150) NOT NULL,
@@ -446,6 +966,7 @@ try {
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         UNIQUE KEY uq_tenant_profile_company (tenant_company_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    }
 
     ensure_column($pdo, 'tenant_company_profiles', 'tenant_company_id', 'BIGINT UNSIGNED NOT NULL');
     ensure_column($pdo, 'tenant_company_profiles', 'nombre', 'VARCHAR(150) NOT NULL DEFAULT ""');
@@ -464,9 +985,11 @@ try {
     ensure_column($pdo, 'tenant_company_profiles', 'notas_internas', 'TEXT NULL');
     ensure_column($pdo, 'tenant_company_profiles', 'logo_filename', 'VARCHAR(255) NULL');
 
-    $pdo->exec('CREATE TABLE IF NOT EXISTS tenant_customers (
+    if (!table_exists($pdo, 'tenant_customers')) {
+      $pdo->exec('CREATE TABLE tenant_customers (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         tenant_company_id BIGINT UNSIGNED NOT NULL,
+      company_id BIGINT UNSIGNED NULL,
         rut VARCHAR(30) NOT NULL,
         razon_social VARCHAR(180) NOT NULL,
         nombre_fantasia VARCHAR(180) NULL,
@@ -483,8 +1006,15 @@ try {
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         UNIQUE KEY uq_customers_company_rut (tenant_company_id, rut)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    }
 
     ensure_column($pdo, 'tenant_customers', 'tenant_company_id', 'BIGINT UNSIGNED NOT NULL');
+  ensure_column($pdo, 'tenant_customers', 'company_id', 'BIGINT UNSIGNED NULL');
+    ensure_column($pdo, 'tenant_customers', 'customer_name', 'VARCHAR(190) NULL');
+    ensure_column($pdo, 'tenant_customers', 'contact_name', 'VARCHAR(190) NULL');
+    ensure_column($pdo, 'tenant_customers', 'contact_email', 'VARCHAR(190) NULL');
+    ensure_column($pdo, 'tenant_customers', 'phone', 'VARCHAR(40) NULL');
+    ensure_column($pdo, 'tenant_customers', 'is_active', 'TINYINT(1) NOT NULL DEFAULT 1');
     ensure_column($pdo, 'tenant_customers', 'rut', 'VARCHAR(30) NOT NULL DEFAULT ""');
     ensure_column($pdo, 'tenant_customers', 'razon_social', 'VARCHAR(180) NOT NULL DEFAULT ""');
     ensure_column($pdo, 'tenant_customers', 'nombre_fantasia', 'VARCHAR(180) NULL');
@@ -497,8 +1027,11 @@ try {
     ensure_column($pdo, 'tenant_customers', 'contacto', 'VARCHAR(150) NULL');
     ensure_column($pdo, 'tenant_customers', 'notas_internas', 'TEXT NULL');
     ensure_column($pdo, 'tenant_customers', 'estado', 'TINYINT(1) NOT NULL DEFAULT 1');
+    ensure_column($pdo, 'tenant_customers', 'deleted_at', 'DATETIME NULL');
+    ensure_column($pdo, 'tenant_customers', 'deleted_by', 'VARCHAR(190) NULL');
 
-    $pdo->exec('CREATE TABLE IF NOT EXISTS tenant_quotes (
+    if (!table_exists($pdo, 'tenant_quotes')) {
+      $pdo->exec('CREATE TABLE tenant_quotes (
       id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
       tenant_company_id BIGINT UNSIGNED NOT NULL,
       customer_id BIGINT UNSIGNED NOT NULL,
@@ -510,6 +1043,10 @@ try {
       total DECIMAL(14,2) NOT NULL DEFAULT 0,
       estado VARCHAR(40) NOT NULL DEFAULT "Pendiente",
       terminos_condiciones_adicionales TEXT NULL,
+      validez_override TEXT NULL,
+      entrega_override TEXT NULL,
+      condicion_de_pago_override TEXT NULL,
+      moneda_override VARCHAR(10) NULL,
       observaciones TEXT NULL,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -517,6 +1054,7 @@ try {
       KEY idx_tenant_quotes_customer (tenant_company_id, customer_id),
       KEY idx_tenant_quotes_estado (tenant_company_id, estado)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    }
 
     ensure_column($pdo, 'tenant_quotes', 'tenant_company_id', 'BIGINT UNSIGNED NOT NULL');
     ensure_column($pdo, 'tenant_quotes', 'customer_id', 'BIGINT UNSIGNED NOT NULL');
@@ -528,13 +1066,22 @@ try {
     ensure_column($pdo, 'tenant_quotes', 'total', 'DECIMAL(14,2) NOT NULL DEFAULT 0');
     ensure_column($pdo, 'tenant_quotes', 'estado', 'VARCHAR(40) NOT NULL DEFAULT "Pendiente"');
     ensure_column($pdo, 'tenant_quotes', 'terminos_condiciones_adicionales', 'TEXT NULL');
+    ensure_column($pdo, 'tenant_quotes', 'validez_override', 'TEXT NULL');
+    ensure_column($pdo, 'tenant_quotes', 'entrega_override', 'TEXT NULL');
+    ensure_column($pdo, 'tenant_quotes', 'condicion_de_pago_override', 'TEXT NULL');
+    ensure_column($pdo, 'tenant_quotes', 'moneda_override', 'VARCHAR(10) NULL');
     ensure_column($pdo, 'tenant_quotes', 'observaciones', 'TEXT NULL');
+    ensure_column($pdo, 'tenant_quotes', 'deleted_at', 'DATETIME NULL');
+    ensure_column($pdo, 'tenant_quotes', 'deleted_by', 'VARCHAR(190) NULL');
 
-    $pdo->exec('CREATE TABLE IF NOT EXISTS tenant_quote_items (
+    if (!table_exists($pdo, 'tenant_quote_items')) {
+      $pdo->exec('CREATE TABLE tenant_quote_items (
       id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
       tenant_quote_id BIGINT UNSIGNED NOT NULL,
       orden INT UNSIGNED NOT NULL DEFAULT 1,
       descripcion VARCHAR(255) NOT NULL,
+      item_type VARCHAR(20) NOT NULL DEFAULT "normal",
+      is_bold TINYINT(1) NOT NULL DEFAULT 0,
       cantidad DECIMAL(14,2) NOT NULL DEFAULT 1,
       precio_unitario DECIMAL(14,2) NOT NULL DEFAULT 0,
       total_linea DECIMAL(14,2) NOT NULL DEFAULT 0,
@@ -542,35 +1089,60 @@ try {
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       KEY idx_tenant_quote_items_quote (tenant_quote_id, orden)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    }
 
     ensure_column($pdo, 'tenant_quote_items', 'tenant_quote_id', 'BIGINT UNSIGNED NOT NULL');
     ensure_column($pdo, 'tenant_quote_items', 'orden', 'INT UNSIGNED NOT NULL DEFAULT 1');
     ensure_column($pdo, 'tenant_quote_items', 'descripcion', 'VARCHAR(255) NOT NULL DEFAULT ""');
+    ensure_column($pdo, 'tenant_quote_items', 'item_type', 'VARCHAR(20) NOT NULL DEFAULT "normal"');
+    ensure_column($pdo, 'tenant_quote_items', 'is_bold', 'TINYINT(1) NOT NULL DEFAULT 0');
     ensure_column($pdo, 'tenant_quote_items', 'cantidad', 'DECIMAL(14,2) NOT NULL DEFAULT 1');
     ensure_column($pdo, 'tenant_quote_items', 'precio_unitario', 'DECIMAL(14,2) NOT NULL DEFAULT 0');
     ensure_column($pdo, 'tenant_quote_items', 'total_linea', 'DECIMAL(14,2) NOT NULL DEFAULT 0');
 
-    $pdo->exec('CREATE TABLE IF NOT EXISTS tenant_plan_usage (
+    if (!table_exists($pdo, 'tenant_plan_usage')) {
+      $pdo->exec('CREATE TABLE tenant_plan_usage (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         tenant_company_id BIGINT UNSIGNED NOT NULL,
         plan_code VARCHAR(40) NOT NULL DEFAULT "basico",
-        storage_limit_mb INT UNSIGNED NOT NULL DEFAULT 1024,
+      storage_limit_mb INT UNSIGNED NOT NULL DEFAULT 100,
         storage_used_mb INT UNSIGNED NOT NULL DEFAULT 0,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         UNIQUE KEY uq_usage_company (tenant_company_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    }
 
       ensure_column($pdo, 'account_signups', 'billing_cycle', 'VARCHAR(20) NOT NULL DEFAULT "monthly"');
+      ensure_column($pdo, 'account_signups', 'password_reset_token_hash', 'VARCHAR(255) NULL');
+      ensure_column($pdo, 'account_signups', 'password_reset_expires_at', 'DATETIME NULL');
+      ensure_column($pdo, 'account_signups', 'password_reset_requested_at', 'DATETIME NULL');
       ensure_column($pdo, 'tenant_companies', 'billing_cycle', 'VARCHAR(20) NOT NULL DEFAULT "monthly"');
 
+      if (filter_var($accountLoginEmail, FILTER_VALIDATE_EMAIL)) {
+        $stSignupByEmail = $pdo->prepare('SELECT id FROM account_signups WHERE LOWER(email) = LOWER(:email) LIMIT 1');
+        $stSignupByEmail->execute(['email' => $accountLoginEmail]);
+        $resolvedSignupId = (int)$stSignupByEmail->fetchColumn();
+        if ($resolvedSignupId > 0) {
+          $signupId = $resolvedSignupId;
+          if ($sessionSignupId !== $resolvedSignupId) {
+            $_SESSION['hermes_company_id'] = $resolvedSignupId;
+          }
+        }
+      }
+
     if ($signupId > 0) {
-        $stSignup = $pdo->prepare('SELECT id, company_name, email, tenant_company_id, payment_status, plan_code, billing_cycle, activated_at, created_at, payment_access_token, payment_access_expires_at FROM account_signups WHERE id = :id LIMIT 1');
+        $stSignup = $pdo->prepare('SELECT id, company_name, contact_name, phone, email, tenant_company_id, payment_status, plan_code, billing_cycle, activated_at, created_at, payment_access_token, payment_access_expires_at FROM account_signups WHERE id = :id LIMIT 1');
         $stSignup->execute(['id' => $signupId]);
         $signup = $stSignup->fetch();
         if ($signup) {
             $companyName = (string)($signup['company_name'] ?? $companyName);
         $accountLoginEmail = (string)($signup['email'] ?? $accountLoginEmail);
+        $accountSettings['email'] = $accountLoginEmail;
+        $accountSettings['company_name'] = (string)($signup['company_name'] ?? '');
+        $accountSettings['contact_name'] = (string)($signup['contact_name'] ?? '');
+        $accountSettings['phone'] = (string)($signup['phone'] ?? '');
+        $accountSettings['created_at'] = (string)($signup['created_at'] ?? '');
         if ($companyEmail === '') {
           $companyEmail = $accountLoginEmail;
         }
@@ -589,9 +1161,16 @@ try {
 
             $token = trim((string)($signup['payment_access_token'] ?? ''));
             $expiresTs = strtotime((string)($signup['payment_access_expires_at'] ?? ''));
-            if ($token !== '' && $expiresTs !== false && $expiresTs > time()) {
+            if ($token === '' || $expiresTs === false || $expiresTs <= time()) {
+              $token = issue_company_payment_token($pdo, (int)$signup['id']);
+            }
+            if ($token !== '') {
+              $planBilling['payment_token'] = $token;
               $planBilling['payment_url'] = '/pagar-plan/?pt=' . rawurlencode($token);
               $planBilling['can_pay_renewal'] = true;
+              $planUpgradeLinks['basico'] = '/pagar-plan/?pt=' . rawurlencode($token) . '&tp=basico';
+              $planUpgradeLinks['pro'] = '/pagar-plan/?pt=' . rawurlencode($token) . '&tp=pro';
+              $planUpgradeLinks['enterprise'] = '/pagar-plan/?pt=' . rawurlencode($token) . '&tp=enterprise';
             }
 
             $cycleDays = billing_cycle_days($planBilling['billing_cycle']);
@@ -701,6 +1280,80 @@ try {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $action = (string)($_POST['action'] ?? '');
 
+        if (!security_validate_csrf($_POST['csrf_token'] ?? '')) {
+            $flash['error'] = 'Solicitud no valida. Recarga la pagina e intenta nuevamente.';
+            $module = (string)($_GET['module'] ?? $module);
+            $_SESSION['hermes_company_postback'] = [
+              'module' => $module,
+              'flash' => $flash,
+              'openCustomerModal' => $openCustomerModal,
+              'openQuoteModal' => $openQuoteModal,
+              'openQuoteEmailModal' => $openQuoteEmailModal,
+              'customerForm' => $customerForm,
+              'quoteForm' => $quoteForm,
+              'quoteEmailForm' => $quoteEmailForm,
+            ];
+            header('Location: ' . dashboard_module_url($module));
+            exit;
+        }
+
+        $writeActions = [
+          'save_company_logo', 'send_password_recovery_link', 'save_company_profile',
+          'add_customer', 'update_customer', 'delete_customer', 'move_customer_to_trash',
+          'delete_quote', 'move_quote_to_trash', 'restore_customer', 'restore_quote',
+          'purge_quote', 'purge_customer', 'quick_update_quote_status', 'add_quote', 'update_quote', 'send_quote_email',
+        ];
+
+        if ($action === '' || !in_array($action, $writeActions, true)) {
+          $flash['error'] = 'Accion no permitida.';
+          $action = '';
+        }
+
+        $ownerAdminOnlyActions = [
+          'save_company_logo',
+          'save_company_profile',
+          'send_password_recovery_link',
+          'purge_quote',
+          'purge_customer',
+          'restore_customer',
+          'restore_quote',
+        ];
+        if ($action !== '' && $role === 'company_user' && in_array($action, $ownerAdminOnlyActions, true)) {
+          $flash['error'] = 'Tu rol no tiene permisos para ejecutar esta accion.';
+          $action = '';
+        }
+
+        if ($action !== '' && in_array($action, $writeActions, true)) {
+          $rateKey = 'dashboard-write:' . (string)$tenantCompanyId . ':' . strtolower((string)$accountLoginEmail);
+          $rate = security_rate_limit_check($pdo, $rateKey, 30, 60);
+          if (!$rate['allowed']) {
+            $flash['error'] = 'Se detectaron demasiadas acciones seguidas. Espera 1 minuto para continuar.';
+            $module = (string)($_GET['module'] ?? $module);
+            $_SESSION['hermes_company_postback'] = [
+              'module' => $module,
+              'flash' => $flash,
+              'openCustomerModal' => $openCustomerModal,
+              'openQuoteModal' => $openQuoteModal,
+              'openQuoteEmailModal' => $openQuoteEmailModal,
+              'customerForm' => $customerForm,
+              'quoteForm' => $quoteForm,
+              'quoteEmailForm' => $quoteEmailForm,
+            ];
+            security_audit_log($pdo, [
+              'tenant_company_id' => $tenantCompanyId,
+              'actor_email' => $accountLoginEmail,
+              'actor_role' => $role,
+              'action_name' => 'dashboard_rate_limited',
+              'entity_name' => 'dashboard_action',
+              'entity_id' => $action,
+              'result_status' => 'blocked',
+              'detail' => ['retry_after' => (int)$rate['retry_after']],
+            ]);
+            header('Location: ' . dashboard_module_url($module));
+            exit;
+          }
+        }
+
         if ($action === 'save_company_logo') {
             try {
                 if (!isset($_FILES['logo'])) {
@@ -741,6 +1394,53 @@ try {
             }
             $module = 'empresa';
         }
+
+          if ($action === 'send_password_recovery_link') {
+            $module = 'configuracion';
+            if ($signupId <= 0) {
+              $flash['error'] = 'No se pudo identificar la cuenta para enviar la recuperacion.';
+            } else {
+              $recipientEmail = trim((string)$accountLoginEmail);
+              if (!filter_var($recipientEmail, FILTER_VALIDATE_EMAIL)) {
+                $flash['error'] = 'Tu cuenta no tiene un email valido para recuperar clave.';
+              } else {
+                $mailCfg = load_mail_credentials();
+                if ($mailCfg === null) {
+                  $flash['error'] = 'No hay configuracion SMTP disponible en el servidor.';
+                } else {
+                  try {
+                    $plainToken = bin2hex(random_bytes(32));
+                    $tokenHash = hash('sha256', $plainToken);
+                    $expiresAt = date('Y-m-d H:i:s', time() + 3600);
+
+                    $upReset = $pdo->prepare('UPDATE account_signups SET password_reset_token_hash = :hash, password_reset_expires_at = :expires_at, password_reset_requested_at = NOW() WHERE id = :id LIMIT 1');
+                    $upReset->execute([
+                      'hash' => $tokenHash,
+                      'expires_at' => $expiresAt,
+                      'id' => $signupId,
+                    ]);
+
+                    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+                    $host = (string)($_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost');
+                    $resetLink = $scheme . '://' . $host . '/restablecer-clave/?t=' . rawurlencode($plainToken);
+                    $recipientName = trim((string)($signup['contact_name'] ?? ''));
+                    if ($recipientName === '') {
+                      $recipientName = trim((string)($signup['company_name'] ?? 'Usuario'));
+                    }
+
+                    $sent = send_password_recovery_email_smtp($mailCfg, $recipientEmail, $recipientName, $resetLink);
+                    if ($sent) {
+                      $flash['ok'] = 'Se envio un enlace de recuperacion a tu correo de cuenta.';
+                    } else {
+                      $flash['error'] = 'No fue posible enviar el correo de recuperacion. Intenta nuevamente.';
+                    }
+                  } catch (Throwable $e) {
+                    $flash['error'] = 'No se pudo generar el enlace de recuperacion.';
+                  }
+                }
+              }
+            }
+          }
 
         if ($action === 'save_company_profile') {
             $profileInput = [
@@ -853,7 +1553,13 @@ try {
 
                   $upCustomer = $pdo->prepare(
                     'UPDATE tenant_customers
-                     SET rut = :rut,
+                     SET company_id = :company_id,
+                       customer_name = :customer_name,
+                       contact_name = :contact_name,
+                       contact_email = :contact_email,
+                       phone = :phone,
+                       is_active = 1,
+                       rut = :rut,
                        razon_social = :razon_social,
                        nombre_fantasia = :nombre_fantasia,
                        direccion = :direccion,
@@ -867,18 +1573,97 @@ try {
                      WHERE id = :id
                        AND tenant_company_id = :tenant_company_id'
                   );
-                  $upCustomer->execute(array_merge(['id' => $customerId, 'tenant_company_id' => $tenantCompanyId], $customerInput));
+                  $legacyCustomerPayload = [
+                    'company_id' => $tenantCompanyId,
+                    'customer_name' => ($customerInput['razon_social'] !== '' ? $customerInput['razon_social'] : $customerInput['rut']),
+                    'contact_name' => ($customerInput['contacto'] !== '' ? $customerInput['contacto'] : null),
+                    'contact_email' => ($customerInput['email'] !== '' ? $customerInput['email'] : null),
+                    'phone' => ($customerInput['telefono'] !== '' ? $customerInput['telefono'] : ($customerInput['celular'] !== '' ? $customerInput['celular'] : null)),
+                  ];
+                  $upCustomer->execute(array_merge([
+                    'id' => $customerId,
+                    'tenant_company_id' => $tenantCompanyId,
+                  ], $legacyCustomerPayload, $customerInput));
                   $flash['ok'] = 'Cliente actualizado correctamente.';
                 } else {
-                  $insCustomer = $pdo->prepare(
-                    'INSERT INTO tenant_customers (
-                      tenant_company_id, rut, razon_social, nombre_fantasia, direccion, comuna, ciudad, telefono, celular, email, contacto, notas_internas, estado
-                     ) VALUES (
-                      :tenant_company_id, :rut, :razon_social, :nombre_fantasia, :direccion, :comuna, :ciudad, :telefono, :celular, :email, :contacto, :notas_internas, 1
-                     )'
+                  $stRut = $pdo->prepare(
+                    'SELECT id, deleted_at
+                     FROM tenant_customers
+                     WHERE tenant_company_id = :tenant_company_id
+                       AND rut = :rut
+                     LIMIT 1'
                   );
-                  $insCustomer->execute(array_merge(['tenant_company_id' => $tenantCompanyId], $customerInput));
-                  $flash['ok'] = 'Cliente agregado correctamente.';
+                  $stRut->execute([
+                    'tenant_company_id' => $tenantCompanyId,
+                    'rut' => $customerInput['rut'],
+                  ]);
+                  $existingByRut = $stRut->fetch();
+
+                  if ($existingByRut) {
+                    $existingId = (int)$existingByRut['id'];
+                    $existingDeletedAt = (string)($existingByRut['deleted_at'] ?? '');
+                    if ($existingDeletedAt !== '') {
+                      $restoreCustomerByRut = $pdo->prepare(
+                        'UPDATE tenant_customers
+                         SET company_id = :company_id,
+                           customer_name = :customer_name,
+                           contact_name = :contact_name,
+                           contact_email = :contact_email,
+                           phone = :phone,
+                           is_active = 1,
+                           razon_social = :razon_social,
+                           nombre_fantasia = :nombre_fantasia,
+                           direccion = :direccion,
+                           comuna = :comuna,
+                           ciudad = :ciudad,
+                           telefono = :telefono,
+                           celular = :celular,
+                           email = :email,
+                           contacto = :contacto,
+                           notas_internas = :notas_internas,
+                           estado = 1,
+                           deleted_at = NULL,
+                           deleted_by = NULL
+                         WHERE id = :id
+                           AND tenant_company_id = :tenant_company_id'
+                      );
+                      $legacyCustomerPayload = [
+                        'company_id' => $tenantCompanyId,
+                        'customer_name' => ($customerInput['razon_social'] !== '' ? $customerInput['razon_social'] : $customerInput['rut']),
+                        'contact_name' => ($customerInput['contacto'] !== '' ? $customerInput['contacto'] : null),
+                        'contact_email' => ($customerInput['email'] !== '' ? $customerInput['email'] : null),
+                        'phone' => ($customerInput['telefono'] !== '' ? $customerInput['telefono'] : ($customerInput['celular'] !== '' ? $customerInput['celular'] : null)),
+                      ];
+                      $restoreCustomerByRut->execute(array_merge([
+                        'id' => $existingId,
+                        'tenant_company_id' => $tenantCompanyId,
+                      ], $legacyCustomerPayload, $customerInput));
+                      $flash['ok'] = 'Cliente restaurado desde papelera y actualizado correctamente.';
+                    } else {
+                      throw new RuntimeException('Ya existe un cliente activo con ese RUT.');
+                    }
+                  } else {
+                    $insCustomer = $pdo->prepare(
+                      'INSERT INTO tenant_customers (
+                        tenant_company_id, company_id, customer_name, contact_name, contact_email, phone, is_active,
+                        rut, razon_social, nombre_fantasia, direccion, comuna, ciudad, telefono, celular, email, contacto, notas_internas, estado
+                       ) VALUES (
+                        :tenant_company_id, :company_id, :customer_name, :contact_name, :contact_email, :phone, 1,
+                        :rut, :razon_social, :nombre_fantasia, :direccion, :comuna, :ciudad, :telefono, :celular, :email, :contacto, :notas_internas, 1
+                       )'
+                    );
+                    $legacyCustomerPayload = [
+                      'customer_name' => ($customerInput['razon_social'] !== '' ? $customerInput['razon_social'] : $customerInput['rut']),
+                      'contact_name' => ($customerInput['contacto'] !== '' ? $customerInput['contacto'] : null),
+                      'contact_email' => ($customerInput['email'] !== '' ? $customerInput['email'] : null),
+                      'phone' => ($customerInput['telefono'] !== '' ? $customerInput['telefono'] : ($customerInput['celular'] !== '' ? $customerInput['celular'] : null)),
+                    ];
+                    $insCustomer->execute(array_merge([
+                      'tenant_company_id' => $tenantCompanyId,
+                      'company_id' => $tenantCompanyId,
+                    ], $legacyCustomerPayload, $customerInput));
+                    $flash['ok'] = 'Cliente agregado correctamente.';
+                  }
                 }
 
                     $customerForm = [
@@ -896,29 +1681,151 @@ try {
                       'notas_internas' => '',
                     ];
                 } catch (Throwable $e) {
-                  $flash['error'] = 'No se pudo guardar el cliente. Verifica si el RUT ya existe.';
+                  $err = trim((string)$e->getMessage());
+                  if ($err !== '') {
+                    $flash['error'] = $err;
+                  } else {
+                    $flash['error'] = 'No se pudo guardar el cliente. Verifica si el RUT ya existe.';
+                  }
                     $openCustomerModal = true;
                 }
                 $module = 'clientes';
             }
         }
 
-        if ($action === 'delete_customer') {
+        if ($action === 'delete_customer' || $action === 'move_customer_to_trash') {
             $customerId = (int)($_POST['customer_id'] ?? 0);
             if ($customerId > 0) {
-                $del = $pdo->prepare('DELETE FROM tenant_customers WHERE id = :id AND tenant_company_id = :tenant_company_id');
-                $del->execute(['id' => $customerId, 'tenant_company_id' => $tenantCompanyId]);
-                $flash['ok'] = 'Cliente eliminado correctamente.';
+                $toTrash = $pdo->prepare(
+                  'UPDATE tenant_customers
+                   SET deleted_at = NOW(), deleted_by = :deleted_by, estado = 0, is_active = 0
+                   WHERE id = :id
+                     AND tenant_company_id = :tenant_company_id
+                     AND deleted_at IS NULL'
+                );
+                $toTrash->execute([
+                  'id' => $customerId,
+                  'tenant_company_id' => $tenantCompanyId,
+                  'deleted_by' => ($accountLoginEmail !== '' ? $accountLoginEmail : 'owner@local.invalid'),
+                ]);
+                if ($toTrash->rowCount() > 0) {
+                  $flash['ok'] = 'Cliente movido a papelera.';
+                }
             }
             $module = 'clientes';
         }
 
-        if ($action === 'delete_quote') {
+        if ($action === 'delete_quote' || $action === 'move_quote_to_trash') {
           $module = 'cotizaciones';
           $quoteId = (int)($_POST['quote_id'] ?? 0);
           if ($quoteId > 0) {
             $stOwnQuote = $pdo->prepare(
-              'SELECT id FROM tenant_quotes WHERE id = :id AND tenant_company_id = :tenant_company_id LIMIT 1'
+              'SELECT id FROM tenant_quotes WHERE id = :id AND tenant_company_id = :tenant_company_id AND deleted_at IS NULL LIMIT 1'
+            );
+            $stOwnQuote->execute(['id' => $quoteId, 'tenant_company_id' => $tenantCompanyId]);
+            if ($stOwnQuote->fetchColumn()) {
+              $toTrash = $pdo->prepare(
+                'UPDATE tenant_quotes
+                 SET deleted_at = NOW(), deleted_by = :deleted_by
+                 WHERE id = :id
+                   AND tenant_company_id = :tenant_company_id
+                   AND deleted_at IS NULL'
+              );
+              $toTrash->execute([
+                'id' => $quoteId,
+                'tenant_company_id' => $tenantCompanyId,
+                'deleted_by' => ($accountLoginEmail !== '' ? $accountLoginEmail : 'owner@local.invalid'),
+              ]);
+              if ($toTrash->rowCount() > 0) {
+                $flash['ok'] = 'Cotizacion movida a papelera.';
+              }
+            } else {
+              $flash['error'] = 'La cotizacion no pertenece a tu empresa.';
+            }
+          }
+        }
+
+        if ($action === 'restore_customer') {
+          $module = 'papelera';
+          $customerId = (int)($_POST['customer_id'] ?? 0);
+          if ($customerId > 0) {
+            try {
+              $restoreCustomer = $pdo->prepare(
+                'UPDATE tenant_customers
+                 SET deleted_at = NULL, deleted_by = NULL, estado = 1, is_active = 1
+                 WHERE id = :id
+                   AND tenant_company_id = :tenant_company_id
+                   AND deleted_at IS NOT NULL'
+              );
+              $restoreCustomer->execute(['id' => $customerId, 'tenant_company_id' => $tenantCompanyId]);
+              if ($restoreCustomer->rowCount() > 0) {
+                $flash['ok'] = 'Cliente restaurado desde papelera.';
+              } else {
+                $flash['error'] = 'No se encontro el cliente en papelera para restaurar.';
+              }
+            } catch (Throwable $e) {
+              $flash['error'] = 'No se pudo restaurar el cliente. Verifica si existe conflicto con datos activos.';
+            }
+          }
+        }
+
+        if ($action === 'restore_quote') {
+          $module = 'papelera';
+          $quoteId = (int)($_POST['quote_id'] ?? 0);
+          if ($quoteId > 0) {
+            $stOwnQuote = $pdo->prepare(
+              'SELECT id, customer_id
+               FROM tenant_quotes
+               WHERE id = :id
+                 AND tenant_company_id = :tenant_company_id
+                 AND deleted_at IS NOT NULL
+               LIMIT 1'
+            );
+            $stOwnQuote->execute(['id' => $quoteId, 'tenant_company_id' => $tenantCompanyId]);
+            $quoteRow = $stOwnQuote->fetch();
+
+            if (!$quoteRow) {
+              $flash['error'] = 'No se encontro la cotizacion en papelera para restaurar.';
+            } else {
+              $stActiveCustomer = $pdo->prepare(
+                'SELECT id
+                 FROM tenant_customers
+                 WHERE id = :customer_id
+                   AND tenant_company_id = :tenant_company_id
+                   AND deleted_at IS NULL
+                 LIMIT 1'
+              );
+              $stActiveCustomer->execute([
+                'customer_id' => (int)$quoteRow['customer_id'],
+                'tenant_company_id' => $tenantCompanyId,
+              ]);
+              if (!$stActiveCustomer->fetchColumn()) {
+                $flash['error'] = 'No se puede restaurar la cotizacion mientras el cliente siga en papelera.';
+              } else {
+                $restoreQuote = $pdo->prepare(
+                  'UPDATE tenant_quotes
+                   SET deleted_at = NULL, deleted_by = NULL
+                   WHERE id = :id
+                     AND tenant_company_id = :tenant_company_id
+                     AND deleted_at IS NOT NULL'
+                );
+                $restoreQuote->execute(['id' => $quoteId, 'tenant_company_id' => $tenantCompanyId]);
+                if ($restoreQuote->rowCount() > 0) {
+                  $flash['ok'] = 'Cotizacion restaurada desde papelera.';
+                } else {
+                  $flash['error'] = 'No se pudo restaurar la cotizacion.';
+                }
+              }
+            }
+          }
+        }
+
+        if ($action === 'purge_quote') {
+          $module = 'papelera';
+          $quoteId = (int)($_POST['quote_id'] ?? 0);
+          if ($quoteId > 0) {
+            $stOwnQuote = $pdo->prepare(
+              'SELECT id FROM tenant_quotes WHERE id = :id AND tenant_company_id = :tenant_company_id AND deleted_at IS NOT NULL LIMIT 1'
             );
             $stOwnQuote->execute(['id' => $quoteId, 'tenant_company_id' => $tenantCompanyId]);
             if ($stOwnQuote->fetchColumn()) {
@@ -931,13 +1838,59 @@ try {
                 $delQuote->execute(['id' => $quoteId, 'tenant_company_id' => $tenantCompanyId]);
 
                 $pdo->commit();
-                $flash['ok'] = 'Cotizacion eliminada correctamente.';
+                $flash['ok'] = 'Cotizacion eliminada de forma definitiva.';
               } catch (Throwable $e) {
                 $pdo->rollBack();
-                $flash['error'] = 'No se pudo eliminar la cotizacion.';
+                $flash['error'] = 'No se pudo eliminar definitivamente la cotizacion.';
               }
             } else {
-              $flash['error'] = 'La cotizacion no pertenece a tu empresa.';
+              $flash['error'] = 'No se encontro la cotizacion en papelera.';
+            }
+          }
+        }
+
+        if ($action === 'purge_customer') {
+          $module = 'papelera';
+          $customerId = (int)($_POST['customer_id'] ?? 0);
+          if ($customerId > 0) {
+            $stOwnCustomer = $pdo->prepare(
+              'SELECT id FROM tenant_customers WHERE id = :id AND tenant_company_id = :tenant_company_id AND deleted_at IS NOT NULL LIMIT 1'
+            );
+            $stOwnCustomer->execute(['id' => $customerId, 'tenant_company_id' => $tenantCompanyId]);
+            if ($stOwnCustomer->fetchColumn()) {
+              $pdo->beginTransaction();
+              try {
+                $stRelatedQuotes = $pdo->prepare(
+                  'SELECT id FROM tenant_quotes WHERE tenant_company_id = :tenant_company_id AND customer_id = :customer_id'
+                );
+                $stRelatedQuotes->execute(['tenant_company_id' => $tenantCompanyId, 'customer_id' => $customerId]);
+                $relatedIds = array_map(static fn($r) => (int)$r['id'], $stRelatedQuotes->fetchAll());
+                $relatedIds = array_values(array_filter($relatedIds, static fn($id) => $id > 0));
+
+                if (!empty($relatedIds)) {
+                  $placeholders = implode(',', array_fill(0, count($relatedIds), '?'));
+                  $delItems = $pdo->prepare("DELETE FROM tenant_quote_items WHERE tenant_quote_id IN ($placeholders)");
+                  $delItems->execute($relatedIds);
+                }
+
+                $delQuotes = $pdo->prepare(
+                  'DELETE FROM tenant_quotes WHERE tenant_company_id = :tenant_company_id AND customer_id = :customer_id'
+                );
+                $delQuotes->execute(['tenant_company_id' => $tenantCompanyId, 'customer_id' => $customerId]);
+
+                $delCustomer = $pdo->prepare(
+                  'DELETE FROM tenant_customers WHERE id = :id AND tenant_company_id = :tenant_company_id'
+                );
+                $delCustomer->execute(['id' => $customerId, 'tenant_company_id' => $tenantCompanyId]);
+
+                $pdo->commit();
+                $flash['ok'] = 'Cliente y datos relacionados eliminados de forma definitiva.';
+              } catch (Throwable $e) {
+                $pdo->rollBack();
+                $flash['error'] = 'No se pudo completar la eliminacion definitiva del cliente.';
+              }
+            } else {
+              $flash['error'] = 'No se encontro el cliente en papelera.';
             }
           }
         }
@@ -980,6 +1933,219 @@ try {
           }
         }
 
+        if ($action === 'send_quote_email') {
+          $module = 'cotizaciones';
+          $quoteId = (int)($_POST['quote_id'] ?? 0);
+
+          $quoteEmailForm = [
+            'quote_id' => (string)$quoteId,
+            'to' => trim((string)($_POST['quote_email_to'] ?? '')),
+            'cc' => trim((string)($_POST['quote_email_cc'] ?? '')),
+            'subject' => trim((string)($_POST['quote_email_subject'] ?? '')),
+            'message' => trim((string)($_POST['quote_email_message'] ?? '')),
+            'include_quote_attachment' => isset($_POST['include_quote_attachment']) ? '1' : '0',
+          ];
+          $openQuoteEmailModal = true;
+
+          if ($quoteId <= 0) {
+            $flash['error'] = 'Debes seleccionar una cotizacion valida para enviar.';
+          } else {
+            $stQuote = $pdo->prepare(
+              'SELECT q.id, q.customer_id, q.numero_cotizacion, q.fecha_emision, q.total, q.estado,
+                      c.razon_social AS customer_name,
+                      c.email AS customer_email
+               FROM tenant_quotes q
+               INNER JOIN tenant_customers c
+                 ON c.id = q.customer_id
+                AND c.tenant_company_id = q.tenant_company_id
+               WHERE q.id = :id
+                 AND q.tenant_company_id = :tenant_company_id
+                 AND q.deleted_at IS NULL
+               LIMIT 1'
+            );
+            $stQuote->execute(['id' => $quoteId, 'tenant_company_id' => $tenantCompanyId]);
+            $quoteRow = $stQuote->fetch();
+
+            if (!$quoteRow) {
+              $flash['error'] = 'La cotizacion seleccionada no pertenece a tu empresa.';
+            } else {
+              if ($quoteEmailForm['to'] === '' && !empty($quoteRow['customer_email'])) {
+                $quoteEmailForm['to'] = trim((string)$quoteRow['customer_email']);
+              }
+
+              $toList = parse_email_list($quoteEmailForm['to'], 10);
+              $ccList = parse_email_list($quoteEmailForm['cc'], 10);
+              if (empty($toList)) {
+                $flash['error'] = 'Ingresa al menos un correo valido en el campo Para.';
+              } else {
+                $mailCfg = load_mail_credentials();
+                if ($mailCfg === null) {
+                  $flash['error'] = 'No hay configuracion SMTP disponible en el servidor.';
+                } else {
+                  $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+                  $host = (string)($_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost');
+                  $previewUrl = $scheme . '://' . $host . '/dashboard/?module=cotizaciones&view_quote_id=' . (int)$quoteRow['id'];
+
+                  if ($quoteEmailForm['subject'] === '') {
+                    $quoteEmailForm['subject'] = 'Cotizacion ' . (string)$quoteRow['numero_cotizacion'] . ' - ' . $companyName;
+                  }
+                  if ($quoteEmailForm['message'] === '') {
+                    $quoteEmailForm['message'] = "Hola,\n\nTe compartimos la cotizacion " . (string)$quoteRow['numero_cotizacion'] . ".\n\nQuedo atento a tus comentarios.";
+                  }
+
+                  $attachments = [];
+                  $totalUploadBytes = 0;
+                  $maxUploadBytes = 25 * 1024 * 1024;
+
+                  if ($quoteEmailForm['include_quote_attachment'] === '1') {
+                    $stQuoteItems = $pdo->prepare(
+                      'SELECT descripcion, item_type, is_bold, cantidad, precio_unitario, total_linea
+                       FROM tenant_quote_items
+                       WHERE tenant_quote_id = :tenant_quote_id
+                       ORDER BY orden ASC, id ASC'
+                    );
+                    $stQuoteItems->execute(['tenant_quote_id' => $quoteId]);
+                    $quoteItemsForMail = $stQuoteItems->fetchAll();
+                    $attachments[] = build_quote_html_attachment((string)$companyName, $previewUrl, $quoteRow, $quoteItemsForMail);
+                  }
+
+                  if (isset($_FILES['quote_email_files']) && is_array($_FILES['quote_email_files'])) {
+                    $files = $_FILES['quote_email_files'];
+                    $names = is_array($files['name'] ?? null) ? $files['name'] : [];
+                    $types = is_array($files['type'] ?? null) ? $files['type'] : [];
+                    $tmpNames = is_array($files['tmp_name'] ?? null) ? $files['tmp_name'] : [];
+                    $errors = is_array($files['error'] ?? null) ? $files['error'] : [];
+                    $sizes = is_array($files['size'] ?? null) ? $files['size'] : [];
+
+                    $fileCount = min(count($names), count($tmpNames), count($errors), count($sizes));
+                    $maxUserFiles = 5;
+                    if ($fileCount > $maxUserFiles) {
+                      $fileCount = $maxUserFiles;
+                    }
+
+                    for ($i = 0; $i < $fileCount; $i++) {
+                      $errCode = (int)($errors[$i] ?? UPLOAD_ERR_NO_FILE);
+                      if ($errCode === UPLOAD_ERR_NO_FILE) {
+                        continue;
+                      }
+                      if ($errCode !== UPLOAD_ERR_OK) {
+                        $flash['error'] = 'Uno de los archivos adjuntos no pudo cargarse correctamente.';
+                        break;
+                      }
+
+                      $tmpPath = (string)($tmpNames[$i] ?? '');
+                      $size = (int)($sizes[$i] ?? 0);
+                      if ($tmpPath === '' || !is_uploaded_file($tmpPath) || $size <= 0) {
+                        $flash['error'] = 'Uno de los archivos adjuntos es invalido.';
+                        break;
+                      }
+                      if ($size > (8 * 1024 * 1024)) {
+                        $flash['error'] = 'Cada adjunto debe pesar como maximo 8 MB.';
+                        break;
+                      }
+
+                      $totalUploadBytes += $size;
+                      if ($totalUploadBytes > $maxUploadBytes) {
+                        $flash['error'] = 'El tamano total de adjuntos supera 25 MB.';
+                        break;
+                      }
+
+                      $content = @file_get_contents($tmpPath);
+                      if ($content === false) {
+                        $flash['error'] = 'No se pudo leer uno de los archivos adjuntos.';
+                        break;
+                      }
+
+                      $name = sanitize_attachment_name((string)($names[$i] ?? ''), 'archivo_' . ($i + 1) . '.bin');
+                      $mime = trim((string)($types[$i] ?? 'application/octet-stream'));
+                      if ($mime === '') {
+                        $mime = 'application/octet-stream';
+                      }
+                      $attachments[] = [
+                        'name' => $name,
+                        'mime' => $mime,
+                        'content' => $content,
+                      ];
+                    }
+                  }
+
+                  if ($flash['error'] === '') {
+                    $safeMessageHtml = nl2br(htmlspecialchars($quoteEmailForm['message'], ENT_QUOTES, 'UTF-8'));
+                    $safePreviewUrl = htmlspecialchars($previewUrl, ENT_QUOTES, 'UTF-8');
+                    $safeQuoteNumber = htmlspecialchars((string)$quoteRow['numero_cotizacion'], ENT_QUOTES, 'UTF-8');
+                    $safeCustomerName = htmlspecialchars((string)($quoteRow['customer_name'] ?? ''), ENT_QUOTES, 'UTF-8');
+                    $safeCompanyName = htmlspecialchars((string)($companyName !== '' ? $companyName : 'GesMan HERMES'), ENT_QUOTES, 'UTF-8');
+
+                    $htmlBody = '<p>' . $safeMessageHtml . '</p>'
+                      . '<p><strong>Cotizacion:</strong> ' . $safeQuoteNumber . '<br>'
+                      . '<strong>Cliente:</strong> ' . $safeCustomerName . '</p>'
+                      . '<p>Puedes revisar la vista imprimible aqui: <a href="' . $safePreviewUrl . '">' . $safePreviewUrl . '</a></p>'
+                      . '<p>Saludos,<br>' . $safeCompanyName . '</p>';
+
+                    $textBody = $quoteEmailForm['message']
+                      . "\n\nCotizacion: " . (string)$quoteRow['numero_cotizacion']
+                      . "\nCliente: " . (string)($quoteRow['customer_name'] ?? '')
+                      . "\nVista imprimible: " . $previewUrl;
+
+                    $sent = send_quote_email_smtp(
+                      $mailCfg,
+                      $toList,
+                      $ccList,
+                      $quoteEmailForm['subject'],
+                      $textBody,
+                      $htmlBody,
+                      $attachments
+                    );
+
+                    if ($sent) {
+                      $flash['ok'] = 'Cotizacion enviada por correo correctamente.';
+                      security_audit_log($pdo, [
+                        'tenant_company_id' => $tenantCompanyId,
+                        'actor_email' => $accountLoginEmail,
+                        'actor_role' => $role,
+                        'action_name' => 'send_quote_email',
+                        'entity_name' => 'quote',
+                        'entity_id' => (string)$quoteId,
+                        'result_status' => 'success',
+                        'detail' => [
+                          'to_count' => count($toList),
+                          'cc_count' => count($ccList),
+                          'attachment_count' => count($attachments),
+                        ],
+                      ]);
+                      $openQuoteEmailModal = false;
+                      $quoteEmailForm = [
+                        'quote_id' => '',
+                        'to' => '',
+                        'cc' => '',
+                        'subject' => '',
+                        'message' => "Hola,\n\nTe compartimos la cotizacion solicitada.\n\nQuedo atento a tus comentarios.",
+                        'include_quote_attachment' => '1',
+                      ];
+                    } else {
+                      $flash['error'] = 'No fue posible enviar el correo de la cotizacion.';
+                      security_audit_log($pdo, [
+                        'tenant_company_id' => $tenantCompanyId,
+                        'actor_email' => $accountLoginEmail,
+                        'actor_role' => $role,
+                        'action_name' => 'send_quote_email',
+                        'entity_name' => 'quote',
+                        'entity_id' => (string)$quoteId,
+                        'result_status' => 'failed',
+                        'detail' => [
+                          'to_count' => count($toList),
+                          'cc_count' => count($ccList),
+                          'attachment_count' => count($attachments),
+                        ],
+                      ]);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
         if ($action === 'add_quote' || $action === 'update_quote') {
           $isEditQuote = $action === 'update_quote';
           $quoteId = (int)($_POST['quote_id'] ?? 0);
@@ -992,6 +2158,10 @@ try {
             'validez_dias' => trim((string)($_POST['validez_dias'] ?? '15')),
             'estado' => trim((string)($_POST['estado'] ?? 'Pendiente')),
             'descuento_pct' => trim((string)($_POST['descuento_pct'] ?? '0')),
+            'validez_override' => trim((string)($_POST['validez_override'] ?? '')),
+            'entrega_override' => trim((string)($_POST['entrega_override'] ?? '')),
+            'condicion_de_pago_override' => trim((string)($_POST['condicion_de_pago_override'] ?? '')),
+            'moneda_override' => strtoupper(trim((string)($_POST['moneda_override'] ?? ''))),
             'terminos_condiciones_adicionales' => trim((string)($_POST['terminos_condiciones_adicionales'] ?? '')),
             'observaciones' => trim((string)($_POST['observaciones'] ?? '')),
             'items' => [],
@@ -1000,6 +2170,8 @@ try {
           $rawDesc = $_POST['item_descripcion'] ?? [];
           $rawQty = $_POST['item_cantidad'] ?? [];
           $rawPrice = $_POST['item_precio'] ?? [];
+          $rawType = $_POST['item_tipo'] ?? [];
+          $rawBold = $_POST['item_negrita'] ?? [];
           if (!is_array($rawDesc)) {
             $rawDesc = [];
           }
@@ -1009,15 +2181,34 @@ try {
           if (!is_array($rawPrice)) {
             $rawPrice = [];
           }
+          if (!is_array($rawType)) {
+            $rawType = [];
+          }
+          if (!is_array($rawBold)) {
+            $rawBold = [];
+          }
 
-          $rows = max(count($rawDesc), count($rawQty), count($rawPrice));
+          $rows = max(count($rawDesc), count($rawQty), count($rawPrice), count($rawType), count($rawBold));
           $itemsToInsert = [];
           $subtotal = 0.0;
 
           for ($i = 0; $i < $rows; $i++) {
             $descripcion = trim((string)($rawDesc[$i] ?? ''));
-            $cantidadRaw = str_replace(',', '.', trim((string)($rawQty[$i] ?? '0')));
-            $precioRaw = str_replace(',', '.', trim((string)($rawPrice[$i] ?? '0')));
+            $cantidadInputRaw = isset($rawQty[$i]) ? trim((string)$rawQty[$i]) : '';
+            $precioInputRaw = isset($rawPrice[$i]) ? trim((string)$rawPrice[$i]) : '';
+            $cantidadRaw = str_replace(',', '.', ($cantidadInputRaw === '' ? '0' : $cantidadInputRaw));
+            $precioRaw = str_replace(',', '.', ($precioInputRaw === '' ? '0' : $precioInputRaw));
+
+            $itemTypeRaw = strtolower(trim((string)($rawType[$i] ?? '')));
+            if ($itemTypeRaw === '') {
+              $itemType = ($cantidadInputRaw === '' && $precioInputRaw === '') ? 'text' : 'normal';
+            } else {
+              $itemType = $itemTypeRaw;
+            }
+            if (!in_array($itemType, ['normal', 'text'], true)) {
+              $itemType = 'normal';
+            }
+            $isBold = ((string)($rawBold[$i] ?? '0') === '1') ? 1 : 0;
             $cantidad = (float)$cantidadRaw;
             $precio = (float)$precioRaw;
 
@@ -1029,7 +2220,27 @@ try {
               'descripcion' => $descripcion,
               'cantidad' => ($cantidadRaw === '' ? '0' : $cantidadRaw),
               'precio' => ($precioRaw === '' ? '0' : $precioRaw),
+              'tipo' => $itemType,
+              'negrita' => (string)$isBold,
             ];
+
+            if ($itemType === 'text') {
+              if ($descripcion === '') {
+                $flash['error'] = 'Cada item de texto requiere descripcion.';
+                $openQuoteModal = true;
+                break;
+              }
+              $itemsToInsert[] = [
+                'orden' => count($itemsToInsert) + 1,
+                'descripcion' => $descripcion,
+                'item_type' => 'text',
+                'is_bold' => $isBold,
+                'cantidad' => 0,
+                'precio_unitario' => 0,
+                'total_linea' => 0,
+              ];
+              continue;
+            }
 
             if ($descripcion === '' || $cantidad <= 0 || $precio < 0) {
               $flash['error'] = 'Cada item requiere descripcion, cantidad mayor a 0 y precio valido.';
@@ -1041,6 +2252,8 @@ try {
             $itemsToInsert[] = [
               'orden' => count($itemsToInsert) + 1,
               'descripcion' => $descripcion,
+              'item_type' => 'normal',
+              'is_bold' => $isBold,
               'cantidad' => $cantidad,
               'precio_unitario' => $precio,
               'total_linea' => $totalLinea,
@@ -1049,7 +2262,7 @@ try {
           }
 
           if (empty($quoteFormInput['items'])) {
-            $quoteFormInput['items'][] = ['descripcion' => '', 'cantidad' => '1', 'precio' => '0'];
+            $quoteFormInput['items'][] = ['descripcion' => '', 'cantidad' => '1', 'precio' => '0', 'tipo' => 'normal', 'negrita' => '0'];
           }
 
           $quoteForm = $quoteFormInput;
@@ -1145,6 +2358,10 @@ try {
                              total = :total,
                              estado = :estado,
                              terminos_condiciones_adicionales = :terminos_condiciones_adicionales,
+                             validez_override = :validez_override,
+                             entrega_override = :entrega_override,
+                             condicion_de_pago_override = :condicion_de_pago_override,
+                             moneda_override = :moneda_override,
                              observaciones = :observaciones
                          WHERE id = :id
                            AND tenant_company_id = :tenant_company_id'
@@ -1161,6 +2378,10 @@ try {
                         'total' => $total,
                         'estado' => $estado,
                         'terminos_condiciones_adicionales' => $quoteFormInput['terminos_condiciones_adicionales'],
+                        'validez_override' => $quoteFormInput['validez_override'],
+                        'entrega_override' => $quoteFormInput['entrega_override'],
+                        'condicion_de_pago_override' => $quoteFormInput['condicion_de_pago_override'],
+                        'moneda_override' => $quoteFormInput['moneda_override'],
                         'observaciones' => $quoteFormInput['observaciones'],
                       ]);
 
@@ -1171,11 +2392,15 @@ try {
                         'INSERT INTO tenant_quotes (
                           tenant_company_id, customer_id, numero_cotizacion,
                           fecha_emision, validez_dias, descuento_pct,
-                          subtotal, total, estado, terminos_condiciones_adicionales, observaciones
+                          subtotal, total, estado, terminos_condiciones_adicionales,
+                          validez_override, entrega_override, condicion_de_pago_override, moneda_override,
+                          observaciones
                          ) VALUES (
                           :tenant_company_id, :customer_id, :numero_cotizacion,
                           :fecha_emision, :validez_dias, :descuento_pct,
-                          :subtotal, :total, :estado, :terminos_condiciones_adicionales, :observaciones
+                          :subtotal, :total, :estado, :terminos_condiciones_adicionales,
+                          :validez_override, :entrega_override, :condicion_de_pago_override, :moneda_override,
+                          :observaciones
                          )'
                       );
                       $insQuote->execute([
@@ -1189,6 +2414,10 @@ try {
                         'total' => $total,
                         'estado' => $estado,
                         'terminos_condiciones_adicionales' => $quoteFormInput['terminos_condiciones_adicionales'],
+                        'validez_override' => $quoteFormInput['validez_override'],
+                        'entrega_override' => $quoteFormInput['entrega_override'],
+                        'condicion_de_pago_override' => $quoteFormInput['condicion_de_pago_override'],
+                        'moneda_override' => $quoteFormInput['moneda_override'],
                         'observaciones' => $quoteFormInput['observaciones'],
                       ]);
                       $quoteId = (int)$pdo->lastInsertId();
@@ -1196,9 +2425,9 @@ try {
 
                     $insItem = $pdo->prepare(
                       'INSERT INTO tenant_quote_items (
-                        tenant_quote_id, orden, descripcion, cantidad, precio_unitario, total_linea
+                        tenant_quote_id, orden, descripcion, item_type, is_bold, cantidad, precio_unitario, total_linea
                        ) VALUES (
-                        :tenant_quote_id, :orden, :descripcion, :cantidad, :precio_unitario, :total_linea
+                        :tenant_quote_id, :orden, :descripcion, :item_type, :is_bold, :cantidad, :precio_unitario, :total_linea
                        )'
                     );
 
@@ -1207,6 +2436,8 @@ try {
                         'tenant_quote_id' => $quoteId,
                         'orden' => $itemRow['orden'],
                         'descripcion' => $itemRow['descripcion'],
+                        'item_type' => $itemRow['item_type'],
+                        'is_bold' => $itemRow['is_bold'],
                         'cantidad' => $itemRow['cantidad'],
                         'precio_unitario' => $itemRow['precio_unitario'],
                         'total_linea' => $itemRow['total_linea'],
@@ -1223,10 +2454,14 @@ try {
                       'validez_dias' => '15',
                       'estado' => 'Pendiente',
                       'descuento_pct' => '0',
+                      'validez_override' => '',
+                      'entrega_override' => '',
+                      'condicion_de_pago_override' => '',
+                      'moneda_override' => '',
                       'terminos_condiciones_adicionales' => '',
                       'observaciones' => '',
                       'items' => [
-                        ['descripcion' => '', 'cantidad' => '1', 'precio' => '0'],
+                        ['descripcion' => '', 'cantidad' => '1', 'precio' => '0', 'tipo' => 'normal', 'negrita' => '0'],
                       ],
                     ];
                     $openQuoteModal = false;
@@ -1241,13 +2476,33 @@ try {
           }
         }
 
+        try {
+          security_audit_log($pdo, [
+            'tenant_company_id' => $tenantCompanyId,
+            'actor_email' => $accountLoginEmail,
+            'actor_role' => $role,
+            'action_name' => ($action !== '' ? 'dashboard_' . $action : 'dashboard_post'),
+            'entity_name' => 'dashboard_action',
+            'entity_id' => ($action !== '' ? $action : null),
+            'result_status' => ($flash['error'] === '' ? 'ok' : 'fail'),
+            'detail' => [
+              'module' => $module,
+              'flash_error' => $flash['error'],
+              'flash_ok' => $flash['ok'],
+            ],
+          ]);
+        } catch (Throwable $auditError) {
+        }
+
         $_SESSION['hermes_company_postback'] = [
           'module' => $module,
           'flash' => $flash,
           'openCustomerModal' => $openCustomerModal,
           'openQuoteModal' => $openQuoteModal,
+          'openQuoteEmailModal' => $openQuoteEmailModal,
           'customerForm' => $customerForm,
           'quoteForm' => $quoteForm,
+          'quoteEmailForm' => $quoteEmailForm,
         ];
         header('Location: ' . dashboard_module_url($module));
         exit;
@@ -1280,7 +2535,7 @@ try {
     $seedUsage->execute([
         'tenant_company_id' => $tenantCompanyId,
         'plan_code' => 'basico',
-        'storage_limit_mb' => 1024,
+      'storage_limit_mb' => 100,
         'storage_used_mb' => 0,
     ]);
 
@@ -1289,8 +2544,17 @@ try {
     $usageRow = $stUsage->fetch();
     if ($usageRow) {
         $usage['plan_code'] = (string)$usageRow['plan_code'];
-        $usage['storage_limit_mb'] = max(1, (int)$usageRow['storage_limit_mb']);
+      $usage['storage_limit_mb'] = max(1, (int)$usageRow['storage_limit_mb']);
         $usage['storage_used_mb'] = max(0, (int)$usageRow['storage_used_mb']);
+      $expectedLimitMb = plan_storage_limit_mb($usage['plan_code']);
+      if (in_array(strtolower(trim((string)$usage['plan_code'])), ['mortal', 'basic', 'basico'], true) && $usage['storage_limit_mb'] !== $expectedLimitMb) {
+        $usage['storage_limit_mb'] = $expectedLimitMb;
+        $upUsageLimit = $pdo->prepare('UPDATE tenant_plan_usage SET storage_limit_mb = :storage_limit_mb WHERE tenant_company_id = :tenant_company_id LIMIT 1');
+        $upUsageLimit->execute([
+          'storage_limit_mb' => $expectedLimitMb,
+          'tenant_company_id' => $tenantCompanyId,
+        ]);
+      }
         if ($usage['storage_used_mb'] > $usage['storage_limit_mb']) {
             $usage['storage_used_mb'] = $usage['storage_limit_mb'];
         }
@@ -1300,22 +2564,23 @@ try {
     $isPaidAccount = ($planBilling['payment_status'] === 'paid') && ($planBilling['plan_status'] === 'paid');
     if ($isPaidAccount) {
       $planBilling['can_pay_renewal'] = false;
+      $currentPlanName = plan_display_name($usage['plan_code']);
       if ($planBilling['days_left'] === null) {
         $planBilling['notice_tone'] = 'ok';
         $planBilling['notice_title'] = 'Plan pagado al dia';
-        $planBilling['notice_text'] = 'Tu cuenta ' . strtolower($planBilling['billing_cycle_name']) . ' esta pagada. El pago de renovacion queda bloqueado para evitar cobros duplicados.';
+        $planBilling['notice_text'] = 'Tu plan ' . $currentPlanName . ' ' . strtolower($planBilling['billing_cycle_name']) . ' esta pagado. Aun no se pudo calcular la fecha de vencimiento.';
       } elseif ($planBilling['days_left'] < 0) {
         $planBilling['notice_tone'] = 'danger';
         $planBilling['notice_title'] = 'Renovacion vencida';
-        $planBilling['notice_text'] = 'Tu plan ' . strtolower($planBilling['billing_cycle_name']) . ' esta vencido hace ' . abs((int)$planBilling['days_left']) . ' dias. Regulariza para evitar suspension.';
+        $planBilling['notice_text'] = 'Tu plan ' . $currentPlanName . ' ' . strtolower($planBilling['billing_cycle_name']) . ' esta vencido hace ' . abs((int)$planBilling['days_left']) . ' dias. Regulariza para evitar suspension.';
       } elseif ($planBilling['days_left'] <= 7) {
         $planBilling['notice_tone'] = 'warn';
         $planBilling['notice_title'] = 'Renovacion proxima';
-        $planBilling['notice_text'] = 'Quedan ' . (int)$planBilling['days_left'] . ' dias para renovar tu plan ' . strtolower($planBilling['billing_cycle_name']) . '.';
+        $planBilling['notice_text'] = 'Quedan ' . (int)$planBilling['days_left'] . ' dias para renovar tu plan ' . $currentPlanName . ' ' . strtolower($planBilling['billing_cycle_name']) . '.';
       } else {
         $planBilling['notice_tone'] = 'ok';
         $planBilling['notice_title'] = 'Plan pagado al dia';
-        $planBilling['notice_text'] = 'Tu plan ' . strtolower($planBilling['billing_cycle_name']) . ' vence en ' . (int)$planBilling['days_left'] . ' dias.';
+        $planBilling['notice_text'] = 'Tu plan ' . $currentPlanName . ' ' . strtolower($planBilling['billing_cycle_name']) . ' esta pagado y vence en ' . (int)$planBilling['days_left'] . ' dias.';
       }
     } else {
       $planBilling['notice_tone'] = 'warn';
@@ -1327,29 +2592,85 @@ try {
       }
     }
 
+    if ($signupId > 0 && table_exists($pdo, 'payment_transactions')) {
+      $paymentHistoryAvailable = true;
+      $stPayments = $pdo->prepare(
+        'SELECT pt.provider, pt.external_reference, pt.preference_id, pt.provider_payment_id, pt.status, pt.amount, pt.currency_id, pt.created_at
+           FROM payment_transactions pt
+           INNER JOIN account_signups s ON s.id = pt.signup_id
+          WHERE pt.signup_id = :signup_id
+            AND LOWER(s.email) = LOWER(:email)
+          ORDER BY pt.id DESC
+          LIMIT 100'
+      );
+      $stPayments->execute([
+        'signup_id' => $signupId,
+        'email' => $accountLoginEmail,
+      ]);
+      $paymentHistoryRows = $stPayments->fetchAll();
+    }
+    if ($accountSettings['email'] === '') {
+      $accountSettings['email'] = $accountLoginEmail;
+    }
+    if ($accountSettings['company_name'] === '') {
+      $accountSettings['company_name'] = $companyName;
+    }
+
     $stCustomers = $pdo->prepare(
       'SELECT id, rut, razon_social, nombre_fantasia, direccion, comuna, ciudad, telefono, celular, email, contacto, notas_internas, estado
          FROM tenant_customers
          WHERE tenant_company_id = :tenant_company_id
+           AND deleted_at IS NULL
          ORDER BY razon_social ASC, id DESC'
     );
     $stCustomers->execute(['tenant_company_id' => $tenantCompanyId]);
     $customers = $stCustomers->fetchAll();
 
+    $stTrashCustomers = $pdo->prepare(
+      'SELECT id, rut, razon_social, nombre_fantasia, email, contacto, deleted_at, deleted_by
+         FROM tenant_customers
+         WHERE tenant_company_id = :tenant_company_id
+           AND deleted_at IS NOT NULL
+         ORDER BY deleted_at DESC, id DESC'
+    );
+    $stTrashCustomers->execute(['tenant_company_id' => $tenantCompanyId]);
+    $trashCustomers = $stTrashCustomers->fetchAll();
+
     $stQuotes = $pdo->prepare(
       'SELECT q.id, q.customer_id, q.numero_cotizacion, q.fecha_emision, q.validez_dias,
-          q.descuento_pct, q.subtotal, q.total, q.estado, q.terminos_condiciones_adicionales, q.observaciones,
-          c.razon_social AS customer_name
+          q.descuento_pct, q.subtotal, q.total, q.estado, q.terminos_condiciones_adicionales,
+          q.validez_override, q.entrega_override, q.condicion_de_pago_override, q.moneda_override,
+          q.observaciones,
+          c.razon_social AS customer_name,
+          c.email AS customer_email,
+          c.contacto AS customer_contact
        FROM tenant_quotes q
        INNER JOIN tenant_customers c
          ON c.id = q.customer_id
         AND c.tenant_company_id = q.tenant_company_id
+        AND c.deleted_at IS NULL
        WHERE q.tenant_company_id = :tenant_company_id
+        AND q.deleted_at IS NULL
        ORDER BY q.id DESC
        LIMIT 200'
     );
     $stQuotes->execute(['tenant_company_id' => $tenantCompanyId]);
     $quotes = $stQuotes->fetchAll();
+
+    $stTrashQuotes = $pdo->prepare(
+      'SELECT q.id, q.numero_cotizacion, q.fecha_emision, q.total, q.estado, q.deleted_at, q.deleted_by,
+          c.razon_social AS customer_name
+       FROM tenant_quotes q
+       LEFT JOIN tenant_customers c
+         ON c.id = q.customer_id
+        AND c.tenant_company_id = q.tenant_company_id
+       WHERE q.tenant_company_id = :tenant_company_id
+         AND q.deleted_at IS NOT NULL
+       ORDER BY q.deleted_at DESC, q.id DESC
+       LIMIT 300'
+    );
+    $stTrashQuotes->execute(['tenant_company_id' => $tenantCompanyId]);
+    $trashQuotes = $stTrashQuotes->fetchAll();
 
     if (!empty($quotes)) {
       $quoteIds = array_map(static fn($row) => (int)$row['id'], $quotes);
@@ -1357,7 +2678,7 @@ try {
       if (!empty($quoteIds)) {
         $placeholders = implode(',', array_fill(0, count($quoteIds), '?'));
         $stItems = $pdo->prepare(
-          "SELECT tenant_quote_id, descripcion, cantidad, precio_unitario, total_linea
+          "SELECT tenant_quote_id, descripcion, item_type, is_bold, cantidad, precio_unitario, total_linea
            FROM tenant_quote_items
            WHERE tenant_quote_id IN ($placeholders)
            ORDER BY tenant_quote_id ASC, orden ASC, id ASC"
@@ -1450,7 +2771,9 @@ try {
       if ($previewQuoteId > 0) {
         $stPreview = $pdo->prepare(
           'SELECT q.id, q.customer_id, q.numero_cotizacion, q.fecha_emision, q.validez_dias,
-              q.descuento_pct, q.subtotal, q.total, q.estado, q.terminos_condiciones_adicionales, q.observaciones,
+              q.descuento_pct, q.subtotal, q.total, q.estado, q.terminos_condiciones_adicionales,
+              q.validez_override, q.entrega_override, q.condicion_de_pago_override, q.moneda_override,
+              q.observaciones,
               c.razon_social AS customer_name, c.rut AS customer_rut,
               c.direccion AS customer_direccion, c.email AS customer_email,
               c.contacto AS customer_contacto
@@ -1470,7 +2793,7 @@ try {
 
         if ($quotePreview) {
           $stPreviewItems = $pdo->prepare(
-            'SELECT descripcion, cantidad, precio_unitario, total_linea
+            'SELECT descripcion, item_type, is_bold, cantidad, precio_unitario, total_linea
              FROM tenant_quote_items
              WHERE tenant_quote_id = :tenant_quote_id
              ORDER BY orden ASC, id ASC'
@@ -1830,10 +3153,40 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       </div>
       <div class="card">
         <h3>Condiciones</h3>
-        <div class="muted">Validez: <?= h(trim((string)$profile['validez']) !== '' ? (string)$profile['validez'] : ((string)$quotePreview['validez_dias'] . ' dias')) ?></div>
-        <div class="muted">Entrega: <?= h(trim((string)$profile['entrega']) !== '' ? (string)$profile['entrega'] : 'No definida') ?></div>
-        <div class="muted">Condicion de pago: <?= h(trim((string)$profile['condicion_de_pago']) !== '' ? (string)$profile['condicion_de_pago'] : 'No definida') ?></div>
-        <div class="muted">Moneda: <?= h(trim((string)$profile['moneda']) !== '' ? (string)$profile['moneda'] : 'CLP') ?></div>
+        <?php
+          $quoteValidezShow = trim((string)($quotePreview['validez_override'] ?? ''));
+          if ($quoteValidezShow === '') {
+            $quoteValidezShow = trim((string)$profile['validez']);
+          }
+          if ($quoteValidezShow === '') {
+            $quoteValidezShow = (string)$quotePreview['validez_dias'] . ' dias';
+          }
+          $quoteEntregaShow = trim((string)($quotePreview['entrega_override'] ?? ''));
+          if ($quoteEntregaShow === '') {
+            $quoteEntregaShow = trim((string)$profile['entrega']);
+          }
+          if ($quoteEntregaShow === '') {
+            $quoteEntregaShow = 'No definida';
+          }
+          $quoteCondPagoShow = trim((string)($quotePreview['condicion_de_pago_override'] ?? ''));
+          if ($quoteCondPagoShow === '') {
+            $quoteCondPagoShow = trim((string)$profile['condicion_de_pago']);
+          }
+          if ($quoteCondPagoShow === '') {
+            $quoteCondPagoShow = 'No definida';
+          }
+          $quoteMonedaShow = trim((string)($quotePreview['moneda_override'] ?? ''));
+          if ($quoteMonedaShow === '') {
+            $quoteMonedaShow = trim((string)$profile['moneda']);
+          }
+          if ($quoteMonedaShow === '') {
+            $quoteMonedaShow = 'CLP';
+          }
+        ?>
+        <div class="muted">Validez: <?= h($quoteValidezShow) ?></div>
+        <div class="muted">Entrega: <?= h($quoteEntregaShow) ?></div>
+        <div class="muted">Condicion de pago: <?= h($quoteCondPagoShow) ?></div>
+        <div class="muted">Moneda: <?= h($quoteMonedaShow) ?></div>
       </div>
     </section>
 
@@ -1852,12 +3205,23 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             <tr><td colspan="4">Sin items.</td></tr>
           <?php else: ?>
             <?php foreach ($quotePreviewItems as $it): ?>
-              <tr>
-                <td><?= h((string)$it['descripcion']) ?></td>
-                <td><?= h((string)$it['cantidad']) ?></td>
-                <td>$<?= h(money_clp((float)$it['precio_unitario'])) ?></td>
-                <td>$<?= h(money_clp((float)$it['total_linea'])) ?></td>
-              </tr>
+                <?php
+                  $previewItemType = strtolower(trim((string)($it['item_type'] ?? 'normal')));
+                  if (!in_array($previewItemType, ['normal', 'text'], true)) {
+                    $previewItemType = 'normal';
+                  }
+                  $previewItemBold = ((int)($it['is_bold'] ?? 0) === 1);
+                  $previewDesc = h((string)$it['descripcion']);
+                  if ($previewItemBold) {
+                    $previewDesc = '<strong>' . $previewDesc . '</strong>';
+                  }
+                ?>
+                <tr>
+                  <td><?= $previewDesc ?></td>
+                  <td><?= $previewItemType === 'text' ? '-' : h((string)$it['cantidad']) ?></td>
+                  <td><?= $previewItemType === 'text' ? '-' : ('$' . h(money_clp((float)$it['precio_unitario']))) ?></td>
+                  <td><?= $previewItemType === 'text' ? '-' : ('$' . h(money_clp((float)$it['total_linea']))) ?></td>
+                </tr>
             <?php endforeach; ?>
           <?php endif; ?>
         </tbody>
@@ -1919,8 +3283,12 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       --ok: #86efac;
       --danger: #fda4af;
       --panel: rgba(15,26,52,.84);
+      --app-header-h: 68px;
     }
     * { box-sizing: border-box; }
+    html {
+      scrollbar-gutter: stable;
+    }
     body {
       margin: 0;
       font-family: Segoe UI, Arial, sans-serif;
@@ -1929,8 +3297,38 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
         radial-gradient(circle at 8% 0%, rgba(255,216,77,.19), transparent 38%),
         radial-gradient(circle at 90% 0%, rgba(91,192,190,.13), transparent 44%),
         linear-gradient(180deg, var(--bg-1), var(--bg-2));
-      min-height: 100vh;
-      overflow-y: scroll;
+      min-height: 100dvh;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: #f4b400 rgba(11,19,43,.58);
+    }
+    body::-webkit-scrollbar,
+    .side::-webkit-scrollbar,
+    .modal-card::-webkit-scrollbar,
+    .quote-preview-card::-webkit-scrollbar {
+      width: 11px;
+      height: 11px;
+    }
+    body::-webkit-scrollbar-track,
+    .side::-webkit-scrollbar-track,
+    .modal-card::-webkit-scrollbar-track,
+    .quote-preview-card::-webkit-scrollbar-track {
+      background: rgba(11,19,43,.58);
+      border-radius: 999px;
+    }
+    body::-webkit-scrollbar-thumb,
+    .side::-webkit-scrollbar-thumb,
+    .modal-card::-webkit-scrollbar-thumb,
+    .quote-preview-card::-webkit-scrollbar-thumb {
+      background: linear-gradient(180deg, #ffe38b, #f4b400);
+      border-radius: 999px;
+      border: 2px solid rgba(11,19,43,.58);
+    }
+    body::-webkit-scrollbar-thumb:hover,
+    .side::-webkit-scrollbar-thumb:hover,
+    .modal-card::-webkit-scrollbar-thumb:hover,
+    .quote-preview-card::-webkit-scrollbar-thumb:hover {
+      background: linear-gradient(180deg, #ffefb8, #f6c744);
     }
     body.spa-loading .content {
       opacity: .62;
@@ -1957,7 +3355,23 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       width: 100%;
       opacity: 0;
     }
-    .layout { display: grid; grid-template-columns: 280px 1fr; min-height: 100vh; }
+    .layout {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      min-height: calc(100dvh - var(--app-header-h));
+      transition: grid-template-columns .26s ease;
+    }
+    .app-header {
+      position: sticky;
+      top: 0;
+      z-index: 52;
+      width: 100%;
+      border: 0;
+      background: rgba(11,19,43,.82);
+      backdrop-filter: saturate(140%) blur(12px);
+      -webkit-backdrop-filter: saturate(140%) blur(12px);
+      box-shadow: 0 10px 24px rgba(2,8,24,.3), inset 0 -1px 0 rgba(42,58,98,.78);
+    }
     .side {
       border-right: 1px solid var(--line);
       background: rgba(7,17,42,.88);
@@ -1965,8 +3379,13 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       display: flex;
       flex-direction: column;
       gap: 1rem;
+      position: sticky;
+      top: var(--app-header-h);
+      height: calc(100dvh - var(--app-header-h));
+      overflow-y: auto;
+      z-index: 38;
+      transition: padding .26s ease;
     }
-    .brand svg { width: 210px; max-width: 100%; }
     .company-box {
       border: 1px solid var(--line);
       border-radius: 12px;
@@ -1988,6 +3407,14 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       padding: .62rem .68rem;
       font-size: .9rem;
       background: rgba(15,26,52,.62);
+      transition: padding .2s ease, justify-content .2s ease, gap .2s ease;
+    }
+    .menu a > span:first-child {
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      transition: opacity .2s ease, width .2s ease, margin .2s ease;
     }
     .menu a.active {
       border-color: #8b6500;
@@ -2021,25 +3448,110 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       stroke-linecap: round;
       stroke-linejoin: round;
     }
+    .side-toggle-wrap {
+      margin-top: auto;
+      display: flex;
+      justify-content: flex-end;
+      padding-top: .45rem;
+      border-top: 1px solid rgba(42,58,98,.6);
+    }
+    .side-toggle {
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
+      border: 1px solid #2f4678;
+      background: linear-gradient(180deg, #163166, #11264f);
+      color: #dce8ff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: transform .2s ease, border-color .2s ease, background .2s ease;
+    }
+    .side-toggle:hover {
+      border-color: #f4b400;
+      transform: translateY(-1px);
+    }
+    .side-toggle svg {
+      width: 15px;
+      height: 15px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.9;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      transition: transform .26s ease;
+    }
+
+    body.side-collapsed .layout {
+      grid-template-columns: 84px 1fr;
+    }
+    body.side-collapsed .side {
+      padding: .72rem .48rem;
+    }
+    body.side-collapsed .menu a {
+      justify-content: center;
+      gap: 0;
+      padding: .58rem .4rem;
+    }
+    body.side-collapsed .menu a > span:first-child {
+      width: 0;
+      opacity: 0;
+      margin: 0;
+      pointer-events: none;
+    }
+    body.side-collapsed .menu .nav-icon {
+      margin: 0;
+    }
+    body.side-collapsed .side-toggle-wrap {
+      justify-content: center;
+    }
+    body.side-collapsed .side-toggle svg {
+      transform: rotate(180deg);
+    }
+    body.side-state-preload .layout,
+    body.side-state-preload .side,
+    body.side-state-preload .menu a,
+    body.side-state-preload .menu a > span:first-child,
+    body.side-state-preload .side-toggle,
+    body.side-state-preload .side-toggle svg {
+      transition: none !important;
+    }
     .content { padding: 1.1rem; }
     .top {
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: .8rem;
-      margin-bottom: .8rem;
+      margin: 0;
       flex-wrap: wrap;
+      width: 100%;
+      min-height: var(--app-header-h);
+      padding: .35rem 1rem;
     }
-    .top h1 { margin: 0; font-size: 1.28rem; color: #fff4b8; }
-    .actions { display: flex; gap: .5rem; }
+    .top-left {
+      display: flex;
+      align-items: center;
+      gap: .6rem;
+      min-width: 0;
+    }
+    .top-left > svg {
+      height: 34px;
+      width: auto;
+      max-width: 100%;
+      display: block;
+      flex: 0 0 auto;
+    }
+    .top h1 { margin: 0; font-size: 1.08rem; color: #fff4b8; line-height: 1.15; }
+    .actions { display: flex; gap: .4rem; }
     .btn {
       border: 1px solid #4b5e8c;
       border-radius: 10px;
       background: linear-gradient(180deg, #152546, #0c1833);
       color: #d3dcef;
       font-weight: 600;
-      padding: .55rem .8rem;
-      font-size: .86rem;
+      padding: .46rem .68rem;
+      font-size: .82rem;
       text-decoration: none;
       cursor: pointer;
       transition: border-color .18s ease, transform .18s ease, box-shadow .18s ease;
@@ -2051,6 +3563,43 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       box-shadow: 0 8px 20px rgba(2,10,30,.3), inset 0 1px 0 rgba(255,255,255,.08);
     }
     .btn:active { transform: translateY(0); }
+    .btn.icon {
+      display: inline-flex;
+      align-items: center;
+      gap: .4rem;
+    }
+    .btn.icon-only {
+      padding: .44rem;
+      min-width: 34px;
+      justify-content: center;
+      gap: 0;
+    }
+    .btn.icon svg {
+      width: 14px;
+      height: 14px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.85;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      flex: 0 0 auto;
+    }
+    .btn.trash {
+      border-color: #8f3450;
+      background: linear-gradient(180deg, #4a1726, #34101b);
+      color: #ffdce4;
+    }
+    .btn.trash:hover {
+      border-color: #ff8fab;
+    }
+    .btn.settings {
+      border-color: #2e5f9a;
+      background: linear-gradient(180deg, #14355d, #0d2441);
+      color: #d6e8ff;
+    }
+    .btn.settings:hover {
+      border-color: #65a6ff;
+    }
     .btn.primary {
       border-color: #8b6500;
       background: linear-gradient(180deg, #ffe38b, #e3a900);
@@ -2071,15 +3620,73 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
     }
     .panel h2 { margin: .1rem 0 .6rem; color: #fff4b8; }
     .panel h3 { margin: .1rem 0 .5rem; color: #f3f4f6; }
-    .msg-ok, .msg-err {
-      border: 1px solid;
-      border-radius: 10px;
-      padding: .7rem;
-      font-size: .92rem;
-      margin-bottom: .7rem;
+    .toast-stack {
+      position: fixed;
+      right: 1rem;
+      bottom: 1rem;
+      z-index: 200;
+      display: grid;
+      gap: .55rem;
+      width: min(420px, calc(100vw - 2rem));
+      pointer-events: none;
     }
-    .msg-ok { border-color: #14532d; background: rgba(20,83,45,.2); color: var(--ok); }
-    .msg-err { border-color: #7f1d1d; background: rgba(127,29,29,.2); color: var(--danger); }
+    .toast {
+      pointer-events: auto;
+      border: 1px solid #2f4678;
+      border-radius: 12px;
+      background: rgba(10,20,44,.94);
+      color: #e5e7eb;
+      box-shadow: 0 14px 36px rgba(2,8,24,.45);
+      padding: .62rem .68rem;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: .55rem;
+      align-items: start;
+      opacity: 0;
+      transform: translateY(12px);
+      transition: opacity .22s ease, transform .22s ease;
+    }
+    .toast.is-visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .toast.is-closing {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    .toast--ok {
+      border-color: rgba(34,197,94,.5);
+      background: linear-gradient(180deg, rgba(20,83,45,.24), rgba(10,20,44,.94));
+      color: #dcfce7;
+    }
+    .toast--err {
+      border-color: rgba(239,68,68,.5);
+      background: linear-gradient(180deg, rgba(127,29,29,.22), rgba(10,20,44,.94));
+      color: #fecaca;
+    }
+    .toast-msg {
+      font-size: .88rem;
+      line-height: 1.34;
+      padding-top: .05rem;
+    }
+    .toast-close {
+      border: 1px solid rgba(255,255,255,.24);
+      background: rgba(11,23,52,.68);
+      color: #e5e7eb;
+      width: 26px;
+      height: 26px;
+      border-radius: 8px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      cursor: pointer;
+      transition: border-color .18s ease, background .18s ease;
+    }
+    .toast-close:hover {
+      border-color: #f4b400;
+      background: rgba(15,26,52,.9);
+    }
     .muted { color: var(--muted); font-size: .9rem; }
     input[type="file"] {
       color: #bfd1f2;
@@ -2106,27 +3713,22 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
     .module-dashboard,
     .module-dashboard body,
     .module-dashboard .layout { min-height: 100vh; }
-    body.module-dashboard { height: 100vh; overflow: hidden; }
+    body.module-dashboard { height: auto; overflow: auto; }
     body.module-dashboard .content {
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
+      height: auto;
+      display: block;
       padding: .9rem 1.1rem 1rem;
-      overflow: hidden;
+      overflow: visible;
     }
     body.module-dashboard #appMain {
-      flex: 1 1 auto;
-      min-height: 0;
-      display: flex;
-      flex-direction: column;
+      min-height: auto;
+      display: block;
     }
-    body.module-dashboard .top { margin-bottom: .55rem; }
+    body.module-dashboard .top { margin-bottom: 0; }
     .dashboard-grid {
-      flex: 1 1 auto;
-      min-height: 0;
       display: grid;
       grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
-      grid-template-rows: auto minmax(0, 1.4fr) minmax(0, 1fr);
+      grid-template-rows: auto auto auto;
       grid-template-areas:
         "kpis kpis"
         "pipeline clients"
@@ -2195,8 +3797,8 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       display: flex;
       flex-direction: column;
       gap: .55rem;
-      min-height: 0;
-      overflow: hidden;
+      min-height: auto;
+      overflow: visible;
       box-shadow: 0 10px 24px rgba(2,8,24,.32);
     }
     .dash-panel-head {
@@ -2227,6 +3829,10 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
     }
 
     .dash-pipeline { grid-area: pipeline; }
+    .dash-pipeline,
+    .dash-top-clients {
+      padding: .72rem .8rem;
+    }
     .dash-pipeline-list {
       list-style: none;
       margin: 0;
@@ -2234,9 +3840,9 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       display: flex;
       flex-direction: column;
       gap: .42rem;
-      flex: 1;
-      min-height: 0;
-      overflow: hidden;
+      flex: 0 0 auto;
+      min-height: auto;
+      overflow: visible;
     }
     .dash-pipeline-item {
       display: grid;
@@ -2316,9 +3922,9 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       display: flex;
       flex-direction: column;
       gap: .42rem;
-      flex: 1;
-      min-height: 0;
-      overflow: hidden;
+      flex: 0 0 auto;
+      min-height: auto;
+      overflow: visible;
     }
     .dash-client {
       display: grid;
@@ -2498,38 +4104,48 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       .dash-pipeline-amount { text-align: left; }
     }
 
-    .module-empresa { min-height: 100vh; }
-    .module-empresa .panel.compact {
+    .module-empresa,
+    .module-configuracion { min-height: 100vh; }
+    .module-empresa .panel.compact,
+    .module-configuracion .panel.compact {
       min-height: calc(100vh - 210px);
       height: auto;
       margin-bottom: 0;
       padding: .66rem .7rem;
     }
-    .module-empresa .empresa-workspace {
+    .module-empresa .empresa-workspace,
+    .module-configuracion .empresa-workspace {
       display: grid;
       grid-template-columns: minmax(280px, 33%) minmax(0, 1fr);
       gap: .62rem;
       min-height: 0;
       height: 100%;
     }
-    .module-empresa .empresa-fields {
+    .module-empresa .empresa-fields,
+    .module-configuracion .empresa-fields {
       min-height: 0;
       display: grid;
       grid-template-rows: 1fr auto;
       gap: .45rem;
     }
-    .module-empresa .grid {
+    .module-empresa .grid,
+    .module-configuracion .grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: .4rem .52rem;
       align-content: start;
       min-height: 0;
     }
-    .module-empresa .field { display: grid; gap: .2rem; }
-    .module-empresa .field label { font-size: .72rem; color: #cbd5e1; }
+    .module-empresa .field,
+    .module-configuracion .field { display: grid; gap: .2rem; }
+    .module-empresa .field label,
+    .module-configuracion .field label { font-size: .72rem; color: #cbd5e1; }
     .module-empresa .field input,
     .module-empresa .field select,
-    .module-empresa .field textarea {
+    .module-empresa .field textarea,
+    .module-configuracion .field input,
+    .module-configuracion .field select,
+    .module-configuracion .field textarea {
       border: 1px solid #334a7f;
       border-radius: 8px;
       background: #0b1734;
@@ -2540,8 +4156,26 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       font-size: .79rem;
       width: 100%;
     }
-    .module-empresa .field textarea.compact-line { resize: none; overflow: hidden; }
-    .module-empresa .field.full { grid-column: span 3; }
+    .module-empresa .field textarea.compact-line,
+    .module-configuracion .field textarea.compact-line { resize: none; overflow: hidden; }
+    .module-empresa .field.full,
+    .module-configuracion .field.full { grid-column: span 3; }
+    .module-configuracion .field input[readonly] {
+      background: linear-gradient(180deg, rgba(11,23,52,.96), rgba(8,18,40,.96));
+      border-color: #3b5b97;
+      color: #dbe7ff;
+      cursor: not-allowed;
+      opacity: 1;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.03);
+    }
+    .module-configuracion .field input:focus,
+    .module-configuracion .field input:focus-visible,
+    .module-configuracion .field select:focus,
+    .module-configuracion .field textarea:focus {
+      outline: none;
+      border-color: #7aa2f7;
+      box-shadow: 0 0 0 3px rgba(122,162,247,.16);
+    }
 
     .module-empresa .empresa-logo-bar {
       border: 1px solid #2a3f6e;
@@ -2910,6 +4544,14 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
     .icon-btn.edit {
       background: linear-gradient(180deg, #1f4d5a, #153a44);
     }
+    .icon-btn.email {
+      background: linear-gradient(180deg, #3f356e, #2a2450);
+      border-color: #5f4ea3;
+      color: #ece9ff;
+    }
+    .icon-btn.email:hover {
+      border-color: #b8a7ff;
+    }
     .delete-confirm-card {
       width: min(460px, 100%);
       border: 1px solid #33528f;
@@ -2928,17 +4570,23 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       font-size: .88rem;
       line-height: 1.35;
     }
-    .delete-confirm-code {
+    .delete-confirm-check {
+      display: flex;
+      align-items: flex-start;
+      gap: .5rem;
       border: 1px solid #33528f;
       border-radius: 9px;
       background: #0b1734;
+      padding: .55rem .62rem;
       color: #e5e7eb;
-      min-height: 38px;
-      padding: .45rem .52rem;
-      font-size: .86rem;
-      width: 100%;
-      text-transform: uppercase;
-      letter-spacing: .04em;
+      font-size: .84rem;
+      line-height: 1.3;
+    }
+    .delete-confirm-check input[type="checkbox"] {
+      margin-top: .1rem;
+      width: 16px;
+      height: 16px;
+      flex: 0 0 auto;
     }
     .quote-preview-card {
       width: min(980px, 100%);
@@ -2966,6 +4614,71 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       margin: 0;
       color: #c8d7ef;
       font-size: .84rem;
+    }
+    .quote-email-card {
+      width: min(760px, 100%);
+      border: 1px solid #33528f;
+      border-radius: 14px;
+      background: linear-gradient(180deg, #0f1f41, #0a1732);
+      box-shadow: 0 26px 60px rgba(2,8,23,.55);
+      overflow: hidden;
+    }
+    .quote-email-form {
+      display: grid;
+      gap: .7rem;
+    }
+    .quote-email-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .65rem;
+    }
+    .quote-email-grid .field {
+      display: grid;
+      gap: .28rem;
+    }
+    .quote-email-grid .field.full {
+      grid-column: 1 / -1;
+    }
+    .quote-email-grid label {
+      font-size: .8rem;
+      color: #c8d7ef;
+    }
+    .quote-email-grid input,
+    .quote-email-grid textarea {
+      border: 1px solid #33528f;
+      border-radius: 9px;
+      background: #0b1734;
+      color: #e5e7eb;
+      min-height: 38px;
+      padding: .45rem .52rem;
+      font-size: .86rem;
+      width: 100%;
+    }
+    .quote-email-grid textarea {
+      min-height: 120px;
+      resize: vertical;
+    }
+    .quote-email-note {
+      margin: 0;
+      color: #9fb4d8;
+      font-size: .79rem;
+      line-height: 1.35;
+    }
+    .quote-email-check {
+      display: inline-flex;
+      align-items: center;
+      gap: .46rem;
+      color: #dbe8ff;
+      font-size: .83rem;
+    }
+    .quote-email-check input {
+      width: 16px;
+      height: 16px;
+    }
+    @media (max-width: 860px) {
+      .quote-email-grid {
+        grid-template-columns: 1fr;
+      }
     }
     .quote-form-grid {
       display: grid;
@@ -3023,6 +4736,39 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       font-weight: 700;
       white-space: nowrap;
     }
+    .quote-items-wrap tr[data-item-bold="1"] input[data-item-descripcion="1"] {
+      font-weight: 800;
+    }
+    .item-style-tools {
+      display: inline-flex;
+      align-items: center;
+      gap: .2rem;
+    }
+    .btn.item-style-btn {
+      min-width: 28px;
+      min-height: 28px;
+      padding: .2rem .36rem;
+      font-size: .74rem;
+      font-weight: 800;
+      border-radius: 7px;
+    }
+    .btn.item-style-btn.active {
+      border-color: #8b6500;
+      background: linear-gradient(180deg, #ffe38b, #e3a900);
+      color: #1f2937;
+    }
+    .item-dash {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 34px;
+      width: 100%;
+      border: 1px dashed rgba(148,163,184,.52);
+      border-radius: 8px;
+      background: rgba(11,23,52,.52);
+      color: #cbd5e1;
+      font-weight: 700;
+    }
     .quote-summary {
       margin-top: .65rem;
       display: flex;
@@ -3033,33 +4779,185 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
     }
     .quote-summary strong { color: #fff4b8; }
 
+    .plan-benefits-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .9rem;
+      margin-top: .95rem;
+    }
+    .plan-benefit-card {
+      border: 1px solid #2f4e8b;
+      border-radius: 12px;
+      background: linear-gradient(180deg, #11224a, #0b1734);
+      padding: .9rem;
+    }
+    .plan-benefit-card h3 {
+      margin: 0 0 .35rem;
+      font-size: .98rem;
+      color: #f4d78f;
+      letter-spacing: .02em;
+    }
+    .plan-benefit-card p {
+      margin: 0;
+      color: #d8e3f8;
+      font-size: .87rem;
+      line-height: 1.45;
+    }
+    .plan-basic-list {
+      margin: .45rem 0 0;
+      padding-left: 1rem;
+      color: #c8d7ef;
+      font-size: .88rem;
+      line-height: 1.45;
+    }
+    .plan-upgrade-grid {
+      margin-top: 1rem;
+      border-top: 1px solid #28406f;
+      padding-top: .9rem;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .8rem;
+    }
+    .plan-upgrade-item {
+      border: 1px solid #2f4e8b;
+      border-radius: 12px;
+      background: linear-gradient(180deg, #102046, #0b1734);
+      padding: .75rem;
+      display: grid;
+      gap: .45rem;
+    }
+    .plan-upgrade-item h4 {
+      margin: 0;
+      font-size: .94rem;
+      color: #fff4b8;
+    }
+    .plan-upgrade-item p {
+      margin: 0;
+      color: #c8d7ef;
+      font-size: .83rem;
+      line-height: 1.4;
+    }
+    .plan-pay-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: fit-content;
+      margin-top: .1rem;
+      padding: .46rem .76rem;
+      border-radius: 999px;
+      border: 1px solid #8b6500;
+      background: linear-gradient(180deg, #ffe38b, #f4b400);
+      color: #1f2937;
+      font-size: .78rem;
+      font-weight: 800;
+      letter-spacing: .02em;
+      text-decoration: none;
+      transition: transform .2s ease, filter .2s ease;
+    }
+    .plan-pay-link:hover { transform: translateY(-1px); filter: brightness(1.04); }
+    .plan-pay-link.alt {
+      border-color: rgba(244,180,0,.45);
+      background: rgba(244,180,0,.12);
+      color: #ffe38b;
+      font-weight: 700;
+    }
+    .plan-pay-link.alt:hover { color: #fff4b8; }
+    .plan-pay-link.disabled {
+      background: rgba(148,163,184,.16);
+      border-color: rgba(148,163,184,.5);
+      color: #cbd5e1;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+    .plan-upgrade-note {
+      margin-top: .65rem;
+      color: #fcd34d;
+      font-size: .79rem;
+    }
+
     @media (max-width: 980px) {
-      .module-empresa { height: auto; overflow: auto; }
-      .module-empresa .content { height: auto; overflow: visible; padding: 1.1rem; }
-      .module-empresa .panel.compact { height: auto; }
-      .module-empresa .empresa-workspace { display: block; height: auto; }
-      .module-empresa .empresa-logo-bar { margin-bottom: .68rem; }
-      .module-empresa .empresa-fields { display: block; }
-      .module-empresa .grid { grid-template-columns: 1fr; }
-      .module-empresa .field.full { grid-column: 1 / -1; }
-      .module-empresa .field textarea.compact-line { min-height: 86px; height: auto; overflow: auto; resize: vertical; }
-      .module-empresa .compact-actions { border-top: 0; padding-top: .7rem; justify-content: flex-start; }
+      .module-empresa,
+      .module-configuracion { height: auto; overflow: auto; }
+      .module-empresa .content,
+      .module-configuracion .content { height: auto; overflow: visible; padding: 1.1rem; }
+      .module-empresa .panel.compact,
+      .module-configuracion .panel.compact { height: auto; }
+      .module-empresa .empresa-workspace,
+      .module-configuracion .empresa-workspace { display: block; height: auto; }
+      .module-empresa .empresa-logo-bar,
+      .module-configuracion .empresa-logo-bar { margin-bottom: .68rem; }
+      .module-empresa .empresa-fields,
+      .module-configuracion .empresa-fields { display: block; }
+      .module-empresa .grid,
+      .module-configuracion .grid { grid-template-columns: 1fr; }
+      .module-empresa .field.full,
+      .module-configuracion .field.full { grid-column: 1 / -1; }
+      .module-empresa .field textarea.compact-line,
+      .module-configuracion .field textarea.compact-line { min-height: 86px; height: auto; overflow: auto; resize: vertical; }
+      .module-empresa .compact-actions,
+      .module-configuracion .compact-actions { border-top: 0; padding-top: .7rem; justify-content: flex-start; }
 
       .layout { grid-template-columns: 1fr; }
-      .side { border-right: 0; border-bottom: 1px solid var(--line); }
+      .app-header { position: sticky; top: 0; }
+      .side {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+        position: static;
+        top: auto;
+        height: auto;
+        overflow: visible;
+      }
+      .side-toggle-wrap { display: none; }
+      .layout { min-height: auto; }
+      :root { --app-header-h: 60px; }
+      .top { padding: .3rem .56rem; }
+      .top h1 { font-size: .96rem; }
+      .top-left > svg { height: 28px; }
       .cards { grid-template-columns: 1fr; }
       .clientes-form-grid { grid-template-columns: 1fr; }
       .quote-form-grid { grid-template-columns: 1fr; }
+      .plan-benefits-grid { grid-template-columns: 1fr; }
+      .plan-upgrade-grid { grid-template-columns: 1fr; }
       .modal-actions { justify-content: flex-start; }
       .cotizaciones-toolbar-right { width: 100%; justify-content: flex-start; }
       .cotizaciones-filters { justify-content: flex-start; }
     }
   </style>
 </head>
-<body class="<?= h($bodyClass) ?>">
+<body class="<?= h($bodyClass) ?> side-state-preload">
+  <script>
+    (function () {
+      try {
+        if (!window.matchMedia('(max-width: 980px)').matches && localStorage.getItem('hermes_side_collapsed_v1') === '1') {
+          document.body.classList.add('side-collapsed');
+        }
+      } catch (error) {
+      }
+    })();
+  </script>
+  <header class="app-header">
+    <div class="top">
+      <div class="top-left">
+        <?php readfile(__DIR__ . '/assets/img/logo-hermes-page.svg'); ?>
+        <h1>Panel empresa - Plan <?= h(plan_display_name($usage['plan_code'])) ?></h1>
+      </div>
+      <div class="actions">
+        <a class="btn icon icon-only settings" href="/empresa/dashboard/?module=configuracion" title="Configuracion de usuario" aria-label="Configuracion de usuario">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 6.2a3.8 3.8 0 1 1 0 7.6 3.8 3.8 0 0 1 0-7.6zm0-3.2 1 .2.5 1.8a5.9 5.9 0 0 1 1.6.9l1.7-.7.7.8-.8 1.6c.4.5.7 1.1.9 1.7l1.8.4.2 1-.2 1-1.8.5a5.9 5.9 0 0 1-.9 1.6l.8 1.7-.7.8-1.7-.8a5.9 5.9 0 0 1-1.6.9l-.5 1.8-1 .2-1-.2-.5-1.8a5.9 5.9 0 0 1-1.6-.9l-1.7.8-.8-.8.8-1.7a5.9 5.9 0 0 1-.9-1.6l-1.8-.5-.2-1 .2-1 1.8-.4c.2-.6.5-1.2.9-1.7l-.8-1.6.8-.8 1.7.7c.5-.4 1.1-.7 1.6-.9l.5-1.8z"/></svg>
+        </a>
+        <a class="btn icon icon-only trash" href="/empresa/dashboard/?module=papelera" title="Ir a papelera" aria-label="Ir a papelera">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5.5h12M7.2 5.5V4a1 1 0 0 1 1-1h3.6a1 1 0 0 1 1 1v1.5M6.2 5.5l.7 10.5h6.2l.7-10.5M8.7 8.2v5.2M11.3 8.2v5.2"/></svg>
+        </a>
+        <form method="post" style="margin:0;">
+          <input type="hidden" name="csrf_token" value="<?= h($csrfToken) ?>">
+          <input type="hidden" name="logout" value="1">
+          <button class="btn" type="submit">Cerrar sesion</button>
+        </form>
+      </div>
+    </div>
+  </header>
   <div class="layout">
     <aside class="side">
-      <div class="brand"><?php readfile(__DIR__ . '/assets/img/logo-hermes-page.svg'); ?></div>
       <nav class="menu" aria-label="Modulos empresa">
         <a class="<?= $module === 'dashboard' ? 'active' : '' ?>" href="/empresa/dashboard/?module=dashboard">
           <span>Dashboard</span>
@@ -3085,28 +4983,38 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             <svg viewBox="0 0 16 16"><path d="M4 2.5h6l2 2V13.5H4zM10 2.5V5h2M6 7h4M6 9.5h4M6 12h3"/></svg>
           </span>
         </a>
+        <a class="<?= $module === 'plan' ? 'active' : '' ?>" href="/empresa/dashboard/?module=plan">
+          <span>Plan</span>
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16"><path d="M2.5 3.5h11v9h-11zM5 6.2h6M5 8.5h6M5 10.8h3.6"/></svg>
+          </span>
+        </a>
       </nav>
+      <div class="side-toggle-wrap">
+        <button class="side-toggle" type="button" data-side-toggle="1" aria-label="Contraer menu" aria-expanded="true" title="Contraer menu">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M12.5 4.5 7 10l5.5 5.5"/></svg>
+        </button>
+      </div>
     </aside>
 
     <main class="content">
-      <div class="top">
-        <h1>Panel empresa - Plan Basico</h1>
-        <div class="actions">
-          <a class="btn" href="/">Ir a HERMES</a>
-          <form method="post" style="margin:0;">
-            <input type="hidden" name="logout" value="1">
-            <button class="btn" type="submit">Cerrar sesion</button>
-          </form>
-        </div>
-      </div>
-
       <div id="appMain">
 
-      <?php if ($flash['ok'] !== ''): ?>
-        <div class="msg-ok"><?= h($flash['ok']) ?></div>
-      <?php endif; ?>
-      <?php if ($flash['error'] !== ''): ?>
-        <div class="msg-err"><?= h($flash['error']) ?></div>
+      <?php if ($flash['ok'] !== '' || $flash['error'] !== ''): ?>
+        <div class="toast-stack" data-toast-stack="1" aria-live="polite" aria-atomic="true">
+          <?php if ($flash['ok'] !== ''): ?>
+            <div class="toast toast--ok" data-toast="1" data-toast-timeout="5000">
+              <div class="toast-msg"><?= h($flash['ok']) ?></div>
+              <button class="toast-close" type="button" data-toast-close="1" aria-label="Cerrar notificacion">&times;</button>
+            </div>
+          <?php endif; ?>
+          <?php if ($flash['error'] !== ''): ?>
+            <div class="toast toast--err" data-toast="1" data-toast-timeout="5000">
+              <div class="toast-msg"><?= h($flash['error']) ?></div>
+              <button class="toast-close" type="button" data-toast-close="1" aria-label="Cerrar notificacion">&times;</button>
+            </div>
+          <?php endif; ?>
+        </div>
       <?php endif; ?>
 
       <?php if ($module === 'dashboard'): ?>
@@ -3213,15 +5121,15 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             <div class="dash-plan-pills">
               <div class="dash-pill">
                 <span class="dash-pill-k">Plan</span>
-                <span class="dash-pill-v"><?= h(ucwords(str_replace('_', ' ', $usage['plan_code']))) ?></span>
+                <span class="dash-pill-v"><?= h(plan_display_name($usage['plan_code'])) ?></span>
               </div>
               <div class="dash-pill">
-                <span class="dash-pill-k">Usado</span>
-                <span class="dash-pill-v"><?= h((string)$usage['storage_used_mb']) ?> MB</span>
+                <span class="dash-pill-k">Consumo</span>
+                <span class="dash-pill-v"><?= h((string)$usage['percent']) ?>%</span>
               </div>
               <div class="dash-pill">
-                <span class="dash-pill-k">Limite</span>
-                <span class="dash-pill-v"><?= h((string)$usage['storage_limit_mb']) ?> MB</span>
+                <span class="dash-pill-k">Disponible</span>
+                <span class="dash-pill-v"><?= h((string)max(0, 100 - (int)$usage['percent'])) ?>%</span>
               </div>
               <div class="dash-pill">
                 <span class="dash-pill-k">Estado pago</span>
@@ -3241,7 +5149,7 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             </div>
             <div class="dash-progress-foot">
               <span><strong><?= h((string)$usage['percent']) ?>%</strong> consumido</span>
-              <span>Disponible: <?= h((string)max(0, (int)$usage['storage_limit_mb'] - (int)$usage['storage_used_mb'])) ?> MB</span>
+              <span>Disponible: <?= h((string)max(0, 100 - (int)$usage['percent'])) ?>%</span>
             </div>
             <div class="dash-plan-renew dash-plan-renew--<?= h($planBilling['notice_tone']) ?>">
               <strong><?= h($planBilling['notice_title']) ?></strong>
@@ -3290,9 +5198,216 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
         </section>
       <?php endif; ?>
 
+      <?php if ($module === 'plan'): ?>
+        <section class="panel compact">
+          <?php
+            $currentPlanNameUi = plan_display_name($usage['plan_code']);
+            $isPlanPaidUi = ($planBilling['payment_status'] === 'paid') && ($planBilling['plan_status'] === 'paid');
+            $currentPlanCodeUi = strtolower(trim((string)$usage['plan_code']));
+            if (in_array($currentPlanCodeUi, ['mortal', 'basic', 'basico'], true)) {
+              $currentPlanCodeUi = 'basico';
+            } elseif (in_array($currentPlanCodeUi, ['heroe', 'pro'], true)) {
+              $currentPlanCodeUi = 'pro';
+            } elseif (in_array($currentPlanCodeUi, ['semidios', 'enterprise'], true)) {
+              $currentPlanCodeUi = 'enterprise';
+            }
+            $planToneUi = $isPlanPaidUi ? 'ok' : 'warn';
+            $planTitleUi = $isPlanPaidUi ? 'Plan pagado' : 'Pago pendiente';
+            if ($planBilling['days_left'] === null) {
+              $planDaysUi = 'No se pudo calcular la fecha de vencimiento del plan.';
+            } elseif ((int)$planBilling['days_left'] < 0) {
+              $planDaysUi = 'Tu plan esta vencido hace ' . abs((int)$planBilling['days_left']) . ' dias.';
+            } else {
+              $planDaysUi = 'Faltan ' . (int)$planBilling['days_left'] . ' dias para que venza tu plan.';
+            }
+            $isPlanUpToDateUi = $isPlanPaidUi && ($planBilling['days_left'] === null || (int)$planBilling['days_left'] >= 0);
+          ?>
+          <h2 style="margin-top:0;">Plan actual del cliente: <?= h($currentPlanNameUi) ?></h2>
+          <p class="muted" style="margin-top:.25rem;">
+            Este modulo resume los beneficios activos del plan <?= h($currentPlanNameUi) ?> para la cuenta empresa.
+            Cuando se habiliten nuevas capacidades del plan, este apartado debe actualizarse para mantener consistencia operativa.
+          </p>
+
+          <div class="dash-plan-renew dash-plan-renew--<?= h($planToneUi) ?>" style="margin-top:.25rem;">
+            <strong><?= h($planTitleUi) ?></strong>
+            <span><?= h($planDaysUi) ?></span>
+          </div>
+
+          <div class="plan-benefits-grid" aria-label="Beneficios del plan actual">
+            <article class="plan-benefit-card">
+              <h3>Gestion base centralizada</h3>
+              <p>Incluye acceso a los modulos esenciales para administrar la operacion diaria en una sola vista.</p>
+              <ul class="plan-basic-list">
+                <li>Dashboard ejecutivo.</li>
+                <li>Empresa (perfil y datos comerciales).</li>
+                <li>Clientes.</li>
+                <li>Cotizaciones.</li>
+                <li>Papelera y configuracion de usuario.</li>
+              </ul>
+            </article>
+
+            <article class="plan-benefit-card">
+              <h3>Control comercial inicial</h3>
+              <p>Permite construir y hacer seguimiento del flujo comercial con trazabilidad de estados y montos.</p>
+              <ul class="plan-basic-list">
+                <li>Creacion de cotizaciones con items y descuentos.</li>
+                <li>Estados operativos de avance.</li>
+                <li>Visualizacion de totales y conversion.</li>
+              </ul>
+            </article>
+
+            <article class="plan-benefit-card">
+              <h3>Operacion segura</h3>
+              <p>Incluye herramientas para reducir errores y respaldar acciones criticas dentro del panel.</p>
+              <ul class="plan-basic-list">
+                <li>Papelera con flujo de eliminacion en pasos.</li>
+                <li>Mensajes de estado y validaciones de formulario.</li>
+                <li>Gestion de cuenta y enlace de recuperacion de clave.</li>
+              </ul>
+            </article>
+
+            <article class="plan-benefit-card">
+              <h3>Estado del plan y almacenamiento</h3>
+              <p>Visualiza el consumo y la renovacion para controlar capacidad disponible del servicio.</p>
+              <ul class="plan-basic-list">
+                <li>Consumo y disponibilidad expresados en porcentaje.</li>
+                <li>Estado de pago y modalidad de facturacion.</li>
+                <li>Fecha de renovacion y alertas de cuenta.</li>
+              </ul>
+            </article>
+          </div>
+
+          <div class="plan-upgrade-grid" aria-label="Cambiar o pagar plan">
+            <article class="plan-upgrade-item">
+              <h4>Plan Mortal</h4>
+              <p>Pago del plan base para mantener operacion y renovacion al dia.</p>
+              <?php if ($isPlanUpToDateUi && $currentPlanCodeUi === 'basico'): ?>
+                <span class="plan-pay-link disabled">Cliente al dia</span>
+              <?php elseif ($planUpgradeLinks['basico'] !== ''): ?>
+                <a class="plan-pay-link" href="<?= h($planUpgradeLinks['basico']) ?>">Ir a pago Mortal</a>
+              <?php else: ?>
+                <span class="plan-pay-link disabled">Sin link de pago</span>
+              <?php endif; ?>
+            </article>
+
+            <article class="plan-upgrade-item">
+              <h4>Plan Heroe</h4>
+              <p>Escala capacidades operativas con funciones extendidas y usuarios tecnicos.</p>
+              <?php if ($isPlanUpToDateUi && $currentPlanCodeUi === 'pro'): ?>
+                <span class="plan-pay-link disabled">Cliente al dia</span>
+              <?php elseif ($planUpgradeLinks['pro'] !== ''): ?>
+                <a class="plan-pay-link alt" href="<?= h($planUpgradeLinks['pro']) ?>">Subir a Heroe</a>
+              <?php else: ?>
+                <span class="plan-pay-link disabled">Sin link de pago</span>
+              <?php endif; ?>
+            </article>
+
+            <article class="plan-upgrade-item">
+              <h4>Plan Semidios</h4>
+              <p>Mayor capacidad para equipos tecnicos y reporteria avanzada interna/cliente.</p>
+              <?php if ($isPlanUpToDateUi && $currentPlanCodeUi === 'enterprise'): ?>
+                <span class="plan-pay-link disabled">Cliente al dia</span>
+              <?php elseif ($planUpgradeLinks['enterprise'] !== ''): ?>
+                <a class="plan-pay-link alt" href="<?= h($planUpgradeLinks['enterprise']) ?>">Subir a Semidios</a>
+              <?php else: ?>
+                <span class="plan-pay-link disabled">Sin link de pago</span>
+              <?php endif; ?>
+            </article>
+
+            <article class="plan-upgrade-item">
+              <h4>Plan Olimpico</h4>
+              <p>Plan empresarial personalizado segun capacidad, prioridad y alcance requerido.</p>
+              <a class="plan-pay-link alt" href="mailto:contacto@gesmanhermes.com?subject=Quiero%20plan%20Olimpico%20GesMan%20HERMES">Contactar para plan Olimpico</a>
+            </article>
+          </div>
+          <p class="plan-upgrade-note">Los links de pago se generan por cuenta y tienen vigencia temporal por seguridad.</p>
+        </section>
+      <?php endif; ?>
+
+      <?php if ($module === 'configuracion'): ?>
+        <section class="panel compact">
+          <h2 style="margin-top:0;">Configuracion de usuario</h2>
+          <p class="muted" style="margin-top:.25rem;">Esta seccion corresponde a tu cuenta de acceso. Los datos de empresa se administran por separado en el modulo Empresa.</p>
+
+          <div class="empresa-fields" style="margin-top:1rem;">
+            <div class="grid">
+              <div class="field">
+                <label>Correo de cuenta</label>
+                <input type="text" value="<?= h((string)$accountSettings['email']) ?>" readonly>
+              </div>
+              <div class="field">
+                <label>Empresa vinculada</label>
+                <input type="text" value="<?= h((string)$accountSettings['company_name']) ?>" readonly>
+              </div>
+              <div class="field">
+                <label>Nombre de contacto</label>
+                <input type="text" value="<?= h((string)$accountSettings['contact_name']) ?>" readonly>
+              </div>
+              <div class="field">
+                <label>Telefono de cuenta</label>
+                <input type="text" value="<?= h((string)$accountSettings['phone']) ?>" readonly>
+              </div>
+            </div>
+          </div>
+
+          <form method="post" style="margin-top:1rem; border-top:1px solid #d9e3f1; padding-top:1rem;">
+            <input type="hidden" name="csrf_token" value="<?= h($csrfToken) ?>">
+            <h3 style="margin:0 0 .5rem 0;">Seguridad de cuenta</h3>
+            <p class="muted" style="margin:.25rem 0 .75rem 0;">Para cambiar clave de manera segura, enviaremos un enlace de recuperacion al correo de tu cuenta. El enlace expira en 60 minutos.</p>
+            <button class="btn" type="submit" name="action" value="send_password_recovery_link">Enviar enlace de recuperacion</button>
+          </form>
+        </section>
+
+        <section class="panel" style="margin-top:1rem;">
+          <h3 style="margin-top:0;">Historial de pagos</h3>
+          <?php if (!$paymentHistoryAvailable): ?>
+            <p class="muted">No hay fuente de historial de pagos disponible en este entorno.</p>
+          <?php elseif (empty($paymentHistoryRows)): ?>
+            <p class="muted">Aun no existen transacciones registradas para esta cuenta.</p>
+          <?php else: ?>
+            <div style="overflow:auto;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Fecha</th>
+                    <th>Proveedor</th>
+                    <th>Estado</th>
+                    <th>Monto</th>
+                    <th>Moneda</th>
+                    <th>Referencia</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <?php foreach ($paymentHistoryRows as $paymentRow): ?>
+                    <?php
+                      $reference = (string)($paymentRow['external_reference'] ?? '');
+                      if ($reference === '') {
+                        $reference = (string)($paymentRow['preference_id'] ?? '');
+                      }
+                      if ($reference === '') {
+                        $reference = (string)($paymentRow['provider_payment_id'] ?? '-');
+                      }
+                    ?>
+                    <tr>
+                      <td><?= h((string)($paymentRow['created_at'] ?? '')) ?></td>
+                      <td><?= h((string)($paymentRow['provider'] ?? '-')) ?></td>
+                      <td><?= h((string)($paymentRow['status'] ?? '-')) ?></td>
+                      <td>$<?= h(money_clp((float)($paymentRow['amount'] ?? 0))) ?></td>
+                      <td><?= h((string)($paymentRow['currency_id'] ?? 'CLP')) ?></td>
+                      <td><?= h($reference) ?></td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
+        </section>
+      <?php endif; ?>
+
       <?php if ($module === 'empresa'): ?>
         <section class="panel compact">
           <form method="post" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="<?= h($csrfToken) ?>">
             <div class="empresa-workspace">
               <div class="empresa-logo-bar">
                 <div class="logo-thumb">
@@ -3443,14 +5558,15 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
                           <button
                             class="icon-btn danger"
                             type="button"
-                            title="Eliminar cliente"
-                            aria-label="Eliminar cliente"
+                            title="Mover cliente a papelera"
+                            aria-label="Mover cliente a papelera"
                             data-open-delete-confirm="1"
-                            data-delete-action="delete_customer"
+                            data-delete-action="move_customer_to_trash"
                             data-delete-id-field="customer_id"
                             data-delete-id-value="<?= h((string)$customer['id']) ?>"
                             data-delete-entity="cliente"
                             data-delete-description="<?= h((string)$customer['razon_social']) ?>"
+                            data-delete-mode="trash"
                           >
                             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5.5h13M8 5.5V4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M6 5.5l.7 10.5h6.6L14 5.5M8.7 8v5.5M11.3 8v5.5"/></svg>
                           </button>
@@ -3472,6 +5588,7 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             </div>
             <div class="modal-body">
               <form method="post" id="customerModalForm">
+                <input type="hidden" name="csrf_token" value="<?= h($csrfToken) ?>">
                 <input type="hidden" name="action" value="<?= $isCustomerEdit ? 'update_customer' : 'add_customer' ?>" data-customer-action="1">
                 <input type="hidden" name="customer_id" value="<?= h((string)($customerForm['id'] ?? '')) ?>" data-customer-id="1">
                 <div class="clientes-form-grid">
@@ -3585,6 +5702,10 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
                         'validez_dias' => (string)$quote['validez_dias'],
                         'estado' => (string)$quote['estado'],
                         'descuento_pct' => (string)$quote['descuento_pct'],
+                        'validez_override' => (string)($quote['validez_override'] ?? ''),
+                        'entrega_override' => (string)($quote['entrega_override'] ?? ''),
+                        'condicion_de_pago_override' => (string)($quote['condicion_de_pago_override'] ?? ''),
+                        'moneda_override' => (string)($quote['moneda_override'] ?? ''),
                         'terminos_condiciones_adicionales' => (string)$quote['terminos_condiciones_adicionales'],
                         'observaciones' => (string)$quote['observaciones'],
                         'items' => array_map(static function ($item) {
@@ -3592,6 +5713,8 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
                             'descripcion' => (string)$item['descripcion'],
                             'cantidad' => (string)$item['cantidad'],
                             'precio' => (string)$item['precio_unitario'],
+                            'tipo' => (string)($item['item_type'] ?? 'normal'),
+                            'negrita' => ((int)($item['is_bold'] ?? 0) === 1) ? '1' : '0',
                           ];
                         }, $items),
                       ];
@@ -3618,6 +5741,7 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
                       <td><strong>$<?= h(money_clp($quote['total'])) ?></strong></td>
                       <td>
                         <form method="post" class="quote-state-form">
+                          <input type="hidden" name="csrf_token" value="<?= h($csrfToken) ?>">
                           <input type="hidden" name="action" value="quick_update_quote_status">
                           <input type="hidden" name="quote_id" value="<?= h((string)$quote['id']) ?>">
                           <select name="estado" class="quote-state-select" data-quote-state-quick="1" aria-label="Estado de cotizacion <?= h((string)$quote['numero_cotizacion']) ?>">
@@ -3642,6 +5766,20 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
                             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 10c1.6-3 4.2-4.5 7.5-4.5s5.9 1.5 7.5 4.5c-1.6 3-4.2 4.5-7.5 4.5S4.1 13 2.5 10zM10 12.7a2.7 2.7 0 1 0 0-5.4 2.7 2.7 0 0 0 0 5.4z"/></svg>
                           </button>
                           <button
+                            class="icon-btn email"
+                            type="button"
+                            title="Enviar por correo"
+                            aria-label="Enviar por correo"
+                            data-open-quote-email="1"
+                            data-quote-id="<?= h((string)$quote['id']) ?>"
+                            data-quote-number="<?= h((string)$quote['numero_cotizacion']) ?>"
+                            data-customer-name="<?= h((string)$quote['customer_name']) ?>"
+                            data-customer-email="<?= h((string)($quote['customer_email'] ?? '')) ?>"
+                            data-print-url="/empresa/dashboard/?module=cotizaciones&amp;view_quote_id=<?= h((string)$quote['id']) ?>"
+                          >
+                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5.5h14v9H3zM3 6l7 5 7-5"/></svg>
+                          </button>
+                          <button
                             class="icon-btn edit"
                             type="button"
                             title="Editar cotizacion"
@@ -3654,14 +5792,15 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
                           <button
                             class="icon-btn danger"
                             type="button"
-                            title="Eliminar cotizacion"
-                            aria-label="Eliminar cotizacion"
+                            title="Mover cotizacion a papelera"
+                            aria-label="Mover cotizacion a papelera"
                             data-open-delete-confirm="1"
-                            data-delete-action="delete_quote"
+                            data-delete-action="move_quote_to_trash"
                             data-delete-id-field="quote_id"
                             data-delete-id-value="<?= h((string)$quote['id']) ?>"
                             data-delete-entity="cotizacion"
                             data-delete-description="<?= h((string)$quote['numero_cotizacion']) ?>"
+                            data-delete-mode="trash"
                           >
                             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5.5h13M8 5.5V4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M6 5.5l.7 10.5h6.6L14 5.5M8.7 8v5.5M11.3 8v5.5"/></svg>
                           </button>
@@ -3686,6 +5825,7 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             </div>
             <div class="modal-body">
               <form method="post" id="quoteModalForm">
+                <input type="hidden" name="csrf_token" value="<?= h($csrfToken) ?>">
                 <input type="hidden" name="action" value="<?= $isQuoteEdit ? 'update_quote' : 'add_quote' ?>" data-quote-action="1">
                 <input type="hidden" name="quote_id" value="<?= h((string)($quoteForm['id'] ?? '')) ?>" data-quote-id="1">
 
@@ -3739,25 +5879,49 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
                   <table>
                     <thead>
                       <tr>
-                        <th style="width:50%;">Descripcion</th>
-                        <th style="width:14%;">Cantidad</th>
-                        <th style="width:16%;">Precio unitario</th>
-                        <th style="width:14%;">Total linea</th>
+                        <th style="width:44%;">Descripcion</th>
+                        <th style="width:12%;">Cantidad</th>
+                        <th style="width:15%;">Precio unitario</th>
+                        <th style="width:13%;">Total linea</th>
+                        <th style="width:10%;">Formato</th>
                         <th style="width:6%;">Accion</th>
                       </tr>
                     </thead>
                     <tbody data-quote-items-body="1">
                       <?php foreach ($quoteForm['items'] as $item): ?>
                         <?php
+                          $itemType = strtolower(trim((string)($item['tipo'] ?? 'normal')));
+                          if (!in_array($itemType, ['normal', 'text'], true)) {
+                            $itemType = 'normal';
+                          }
+                          $itemIsBold = ((string)($item['negrita'] ?? '0') === '1');
                           $itemQty = (float)str_replace(',', '.', (string)($item['cantidad'] ?? 0));
                           $itemPrice = (float)str_replace(',', '.', (string)($item['precio'] ?? 0));
-                          $itemTotal = $itemQty > 0 ? ($itemQty * $itemPrice) : 0;
+                          $itemTotal = ($itemType === 'text') ? 0 : (($itemQty > 0 ? ($itemQty * $itemPrice) : 0));
                         ?>
-                        <tr>
-                          <td><input type="text" name="item_descripcion[]" value="<?= h($item['descripcion']) ?>" required></td>
-                          <td><input type="number" name="item_cantidad[]" value="<?= h((string)$item['cantidad']) ?>" min="0.01" step="0.01" data-item-cantidad="1" required></td>
-                          <td><input type="number" name="item_precio[]" value="<?= h((string)$item['precio']) ?>" min="0" step="0.01" data-item-precio="1" required></td>
-                          <td><span class="line-total" data-line-total="1">$<?= h(money_clp($itemTotal)) ?></span></td>
+                        <tr data-item-row="1" data-item-type="<?= h($itemType) ?>" data-item-bold="<?= $itemIsBold ? '1' : '0' ?>">
+                          <td>
+                            <input type="text" name="item_descripcion[]" value="<?= h($item['descripcion']) ?>" data-item-descripcion="1" required>
+                            <input type="hidden" name="item_tipo[]" value="<?= h($itemType) ?>" data-item-type-input="1">
+                            <input type="hidden" name="item_negrita[]" value="<?= $itemIsBold ? '1' : '0' ?>" data-item-bold-input="1">
+                          </td>
+                          <td>
+                            <input type="number" name="item_cantidad[]" value="<?= h((string)$item['cantidad']) ?>" min="0.01" step="0.01" data-item-cantidad="1" <?= $itemType === 'text' ? 'readonly' : '' ?> required>
+                            <span class="item-dash" data-item-dash="qty" <?= $itemType === 'text' ? '' : 'style="display:none;"' ?>>-</span>
+                          </td>
+                          <td>
+                            <input type="number" name="item_precio[]" value="<?= h((string)$item['precio']) ?>" min="0" step="0.01" data-item-precio="1" <?= $itemType === 'text' ? 'readonly' : '' ?> required>
+                            <span class="item-dash" data-item-dash="price" <?= $itemType === 'text' ? '' : 'style="display:none;"' ?>>-</span>
+                          </td>
+                          <td>
+                            <span class="line-total" data-line-total="1"><?= $itemType === 'text' ? '-' : ('$' . h(money_clp($itemTotal))) ?></span>
+                          </td>
+                          <td>
+                            <div class="item-style-tools">
+                              <button class="btn item-style-btn<?= $itemIsBold ? ' active' : '' ?>" type="button" data-item-bold-toggle="1" title="Negrita">N</button>
+                              <button class="btn item-style-btn<?= $itemType === 'text' ? ' active' : '' ?>" type="button" data-item-type-toggle="1" title="Texto sin precio">T</button>
+                            </div>
+                          </td>
                           <td><button class="btn danger" type="button" data-quote-remove-item="1">X</button></td>
                         </tr>
                       <?php endforeach; ?>
@@ -3767,6 +5931,25 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
 
                 <div style="margin-top:.65rem; display:flex; justify-content:flex-start;">
                   <button class="btn" type="button" data-quote-add-item="1">Agregar item</button>
+                </div>
+
+                <div class="quote-form-grid" style="margin-top:.72rem;">
+                  <div class="field full">
+                    <label>Validez especial de esta cotizacion (opcional)</label>
+                    <textarea name="validez_override" placeholder="Si queda en blanco, se usa la validez definida en Empresa."><?= h((string)($quoteForm['validez_override'] ?? '')) ?></textarea>
+                  </div>
+                  <div class="field full">
+                    <label>Entrega especial de esta cotizacion (opcional)</label>
+                    <textarea name="entrega_override" placeholder="Si queda en blanco, se usa la entrega definida en Empresa."><?= h((string)($quoteForm['entrega_override'] ?? '')) ?></textarea>
+                  </div>
+                  <div class="field full">
+                    <label>Condicion de pago especial (opcional)</label>
+                    <textarea name="condicion_de_pago_override" placeholder="Si queda en blanco, se usa la condicion de pago definida en Empresa."><?= h((string)($quoteForm['condicion_de_pago_override'] ?? '')) ?></textarea>
+                  </div>
+                  <div class="field">
+                    <label>Moneda especial (opcional)</label>
+                    <input type="text" name="moneda_override" maxlength="10" value="<?= h((string)($quoteForm['moneda_override'] ?? '')) ?>" placeholder="Ej: CLP, USD, EUR">
+                  </div>
                 </div>
 
                 <div class="quote-summary">
@@ -3779,6 +5962,56 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
                 <div class="modal-actions">
                   <button class="btn" type="button" data-close-quote-modal="1">Cancelar</button>
                   <button class="btn primary" type="submit" data-quote-submit-label="1"><?= $isQuoteEdit ? 'Actualizar cotizacion' : 'Guardar cotizacion' ?></button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-backdrop<?= $openQuoteEmailModal ? ' open' : '' ?>" id="quoteEmailModal" aria-hidden="<?= $openQuoteEmailModal ? 'false' : 'true' ?>">
+          <div class="quote-email-card" role="dialog" aria-modal="true" aria-labelledby="quoteEmailModalTitle">
+            <div class="modal-head">
+              <h3 id="quoteEmailModalTitle">Enviar cotizacion por correo</h3>
+              <button class="btn" type="button" data-close-quote-email="1">Cerrar</button>
+            </div>
+            <div class="modal-body">
+              <form method="post" enctype="multipart/form-data" class="quote-email-form" id="quoteEmailForm">
+                <input type="hidden" name="csrf_token" value="<?= h($csrfToken) ?>">
+                <input type="hidden" name="action" value="send_quote_email">
+                <input type="hidden" name="quote_id" value="<?= h((string)($quoteEmailForm['quote_id'] ?? '')) ?>" data-quote-email-id="1">
+
+                <div class="quote-email-grid">
+                  <div class="field full">
+                    <label>Para (separar varios con coma)</label>
+                    <input type="text" name="quote_email_to" value="<?= h((string)($quoteEmailForm['to'] ?? '')) ?>" placeholder="cliente@empresa.com" required data-quote-email-to="1">
+                  </div>
+                  <div class="field full">
+                    <label>CC (opcional)</label>
+                    <input type="text" name="quote_email_cc" value="<?= h((string)($quoteEmailForm['cc'] ?? '')) ?>" placeholder="supervisor@empresa.com, compras@empresa.com" data-quote-email-cc="1">
+                  </div>
+                  <div class="field full">
+                    <label>Asunto</label>
+                    <input type="text" name="quote_email_subject" value="<?= h((string)($quoteEmailForm['subject'] ?? '')) ?>" required data-quote-email-subject="1">
+                  </div>
+                  <div class="field full">
+                    <label>Mensaje</label>
+                    <textarea name="quote_email_message" required data-quote-email-message="1"><?= h((string)($quoteEmailForm['message'] ?? '')) ?></textarea>
+                  </div>
+                  <div class="field full">
+                    <label>Adjuntos opcionales (max 5 archivos, 8 MB c/u)</label>
+                    <input type="file" name="quote_email_files[]" multiple>
+                  </div>
+                </div>
+
+                <label class="quote-email-check">
+                  <input type="checkbox" name="include_quote_attachment" value="1" <?= ((string)($quoteEmailForm['include_quote_attachment'] ?? '1') === '1') ? 'checked' : '' ?> data-quote-email-include="1">
+                  Adjuntar resumen de la cotizacion en archivo HTML
+                </label>
+                <p class="quote-email-note" data-quote-email-meta="1">Se incluira tambien el enlace a la vista imprimible de la cotizacion.</p>
+
+                <div class="modal-actions">
+                  <button class="btn" type="button" data-close-quote-email="1">Cancelar</button>
+                  <button class="btn primary" type="submit">Enviar correo</button>
                 </div>
               </form>
             </div>
@@ -3802,28 +6035,159 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
         </div>
       <?php endif; ?>
 
-      <?php if ($module === 'clientes' || $module === 'cotizaciones'): ?>
+      <?php if ($module === 'papelera'): ?>
+        <section class="panel">
+          <h2>Papelera de reciclaje</h2>
+          <p class="muted">Los registros aqui pueden eliminarse de forma definitiva. Esta accion no se puede deshacer.</p>
+
+          <h3 style="margin-top:1rem;">Clientes en papelera</h3>
+          <?php if (empty($trashCustomers)): ?>
+            <p class="muted">No hay clientes en papelera.</p>
+          <?php else: ?>
+            <div style="overflow:auto;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>RUT</th><th>Razon social</th><th>Contacto</th><th>Eliminado por</th><th>Fecha</th><th>Acciones</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <?php foreach ($trashCustomers as $trashCustomer): ?>
+                    <tr>
+                      <td><?= h((string)$trashCustomer['rut']) ?></td>
+                      <td><?= h((string)$trashCustomer['razon_social']) ?></td>
+                      <td><?= h((string)$trashCustomer['contacto']) ?></td>
+                      <td><?= h((string)($trashCustomer['deleted_by'] ?? 'N/D')) ?></td>
+                      <td><?= h((string)($trashCustomer['deleted_at'] ?? '')) ?></td>
+                      <td class="quote-action-cell">
+                        <div class="action-icons">
+                          <button
+                            class="icon-btn edit"
+                            type="button"
+                            title="Restaurar cliente"
+                            aria-label="Restaurar cliente"
+                            data-open-delete-confirm="1"
+                            data-delete-action="restore_customer"
+                            data-delete-id-field="customer_id"
+                            data-delete-id-value="<?= h((string)$trashCustomer['id']) ?>"
+                            data-delete-entity="cliente"
+                            data-delete-description="<?= h((string)$trashCustomer['razon_social']) ?>"
+                            data-delete-mode="restore"
+                          >
+                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10a6 6 0 1 0 2-4.5M4 5v4h4"/></svg>
+                          </button>
+                          <button
+                            class="icon-btn danger"
+                            type="button"
+                            title="Eliminar cliente de forma definitiva"
+                            aria-label="Eliminar cliente de forma definitiva"
+                            data-open-delete-confirm="1"
+                            data-delete-action="purge_customer"
+                            data-delete-id-field="customer_id"
+                            data-delete-id-value="<?= h((string)$trashCustomer['id']) ?>"
+                            data-delete-entity="cliente"
+                            data-delete-description="<?= h((string)$trashCustomer['razon_social']) ?>"
+                            data-delete-mode="purge"
+                          >
+                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5.5h13M8 5.5V4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M6 5.5l.7 10.5h6.6L14 5.5M8.7 8v5.5M11.3 8v5.5"/></svg>
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
+
+          <h3 style="margin-top:1rem;">Cotizaciones en papelera</h3>
+          <?php if (empty($trashQuotes)): ?>
+            <p class="muted">No hay cotizaciones en papelera.</p>
+          <?php else: ?>
+            <div style="overflow:auto;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>#</th><th>Cliente</th><th>Total</th><th>Estado</th><th>Eliminado por</th><th>Fecha</th><th>Acciones</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <?php foreach ($trashQuotes as $trashQuote): ?>
+                    <tr>
+                      <td><?= h((string)$trashQuote['numero_cotizacion']) ?></td>
+                      <td><?= h((string)($trashQuote['customer_name'] ?: 'Cliente eliminado')) ?></td>
+                      <td>$<?= h(money_clp((float)$trashQuote['total'])) ?></td>
+                      <td><?= h((string)$trashQuote['estado']) ?></td>
+                      <td><?= h((string)($trashQuote['deleted_by'] ?? 'N/D')) ?></td>
+                      <td><?= h((string)($trashQuote['deleted_at'] ?? '')) ?></td>
+                      <td class="quote-action-cell">
+                        <div class="action-icons">
+                          <button
+                            class="icon-btn edit"
+                            type="button"
+                            title="Restaurar cotizacion"
+                            aria-label="Restaurar cotizacion"
+                            data-open-delete-confirm="1"
+                            data-delete-action="restore_quote"
+                            data-delete-id-field="quote_id"
+                            data-delete-id-value="<?= h((string)$trashQuote['id']) ?>"
+                            data-delete-entity="cotizacion"
+                            data-delete-description="<?= h((string)$trashQuote['numero_cotizacion']) ?>"
+                            data-delete-mode="restore"
+                          >
+                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10a6 6 0 1 0 2-4.5M4 5v4h4"/></svg>
+                          </button>
+                          <button
+                            class="icon-btn danger"
+                            type="button"
+                            title="Eliminar cotizacion de forma definitiva"
+                            aria-label="Eliminar cotizacion de forma definitiva"
+                            data-open-delete-confirm="1"
+                            data-delete-action="purge_quote"
+                            data-delete-id-field="quote_id"
+                            data-delete-id-value="<?= h((string)$trashQuote['id']) ?>"
+                            data-delete-entity="cotizacion"
+                            data-delete-description="<?= h((string)$trashQuote['numero_cotizacion']) ?>"
+                            data-delete-mode="purge"
+                          >
+                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5.5h13M8 5.5V4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M6 5.5l.7 10.5h6.6L14 5.5M8.7 8v5.5M11.3 8v5.5"/></svg>
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
+        </section>
+      <?php endif; ?>
+
+      <?php if ($module === 'clientes' || $module === 'cotizaciones' || $module === 'papelera'): ?>
         <div class="modal-backdrop" id="deleteConfirmModal" aria-hidden="true">
           <div class="delete-confirm-card" role="dialog" aria-modal="true" aria-labelledby="deleteConfirmTitle">
             <div class="modal-head">
-              <h3 id="deleteConfirmTitle">Confirmar eliminacion</h3>
+              <h3 id="deleteConfirmTitle" data-delete-confirm-title="1">Confirmar accion</h3>
               <button class="btn" type="button" data-close-delete-confirm="1">Cerrar</button>
             </div>
             <div class="delete-confirm-body">
               <p class="delete-confirm-text" data-delete-confirm-description="1"></p>
               <div data-delete-step-one="1">
-                <p class="delete-confirm-text">Primer paso: confirma que quieres continuar con la eliminacion.</p>
+                <p class="delete-confirm-text" data-delete-step-one-text="1">Primer paso: confirma que quieres continuar.</p>
                 <div class="modal-actions" style="margin-top:.5rem;">
                   <button class="btn" type="button" data-close-delete-confirm="1">Cancelar</button>
                   <button class="btn danger" type="button" data-delete-go-step-two="1">Continuar</button>
                 </div>
               </div>
               <div data-delete-step-two="1" style="display:none;">
-                <p class="delete-confirm-text">Segundo paso: escribe ELIMINAR para habilitar el boton final.</p>
-                <input class="delete-confirm-code" type="text" autocomplete="off" spellcheck="false" placeholder="Escribe ELIMINAR" data-delete-confirm-input="1">
+                <p class="delete-confirm-text" data-delete-step-two-text="1">Segundo paso: confirma la accion para habilitar el boton final.</p>
+                <label class="delete-confirm-check" data-delete-check-wrap="1">
+                  <input type="checkbox" data-delete-confirm-checkbox="1">
+                  <span data-delete-check-text="1">Confirmo que entiendo esta accion.</span>
+                </label>
                 <div class="modal-actions" style="margin-top:.5rem;">
                   <button class="btn" type="button" data-delete-back-step-one="1">Volver</button>
-                  <button class="btn danger" type="button" data-delete-submit="1" disabled>Eliminar definitivamente</button>
+                  <button class="btn danger" type="button" data-delete-submit="1" disabled data-delete-submit-label="1">Eliminar definitivamente</button>
                 </div>
               </div>
             </div>
@@ -3841,10 +6205,12 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       var isNavigating = false;
       var customerModalCleanup = null;
       var quoteModalCleanup = null;
+      var quoteEmailCleanup = null;
       var quotePreviewCleanup = null;
       var deleteConfirmCleanup = null;
       var quoteFiltersCleanup = null;
       var quoteQuickStateCleanup = null;
+      var sideToggleCleanup = null;
 
       function stripDiacritics(value) {
         var text = String(value || '');
@@ -3924,6 +6290,130 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
           searchInput.removeEventListener('input', applyFilters);
           stateSelect.removeEventListener('change', applyFilters);
           customerSelect.removeEventListener('change', applyFilters);
+        };
+      }
+
+      function bindToasts() {
+        var toasts = document.querySelectorAll('[data-toast="1"]');
+        if (!toasts.length) {
+          return;
+        }
+
+        toasts.forEach(function (toast) {
+          var timeoutMs = Number(toast.getAttribute('data-toast-timeout') || '5000');
+          if (!isFinite(timeoutMs) || timeoutMs < 0) {
+            timeoutMs = 5000;
+          }
+
+          var closeBtn = toast.querySelector('[data-toast-close="1"]');
+          var closed = false;
+          var closeTimerId = null;
+
+          function removeToast() {
+            var parent = toast.parentElement;
+            toast.remove();
+            if (parent && parent.matches('[data-toast-stack="1"]') && parent.children.length === 0) {
+              parent.remove();
+            }
+          }
+
+          function closeToast() {
+            if (closed) {
+              return;
+            }
+            closed = true;
+            if (closeTimerId !== null) {
+              clearTimeout(closeTimerId);
+              closeTimerId = null;
+            }
+            toast.classList.remove('is-visible');
+            toast.classList.add('is-closing');
+            window.setTimeout(removeToast, 230);
+          }
+
+          window.requestAnimationFrame(function () {
+            toast.classList.add('is-visible');
+          });
+
+          closeTimerId = window.setTimeout(closeToast, timeoutMs);
+          if (closeBtn) {
+            closeBtn.addEventListener('click', closeToast);
+          }
+        });
+      }
+
+      function bindSideMenuToggle() {
+        if (typeof sideToggleCleanup === 'function') {
+          sideToggleCleanup();
+          sideToggleCleanup = null;
+        }
+
+        var toggleBtn = document.querySelector('[data-side-toggle="1"]');
+        if (!toggleBtn) {
+          document.body.classList.remove('side-state-preload');
+          return;
+        }
+
+        var storageKey = 'hermes_side_collapsed_v1';
+
+        function applyCollapsed(collapsed) {
+          if (window.matchMedia('(max-width: 980px)').matches) {
+            document.body.classList.remove('side-collapsed');
+            toggleBtn.setAttribute('aria-expanded', 'true');
+            toggleBtn.setAttribute('aria-label', 'Contraer menu');
+            toggleBtn.setAttribute('title', 'Contraer menu');
+            return;
+          }
+
+          if (collapsed) {
+            document.body.classList.add('side-collapsed');
+            toggleBtn.setAttribute('aria-expanded', 'false');
+            toggleBtn.setAttribute('aria-label', 'Expandir menu');
+            toggleBtn.setAttribute('title', 'Expandir menu');
+          } else {
+            document.body.classList.remove('side-collapsed');
+            toggleBtn.setAttribute('aria-expanded', 'true');
+            toggleBtn.setAttribute('aria-label', 'Contraer menu');
+            toggleBtn.setAttribute('title', 'Contraer menu');
+          }
+        }
+
+        function onToggleClick() {
+          var collapsed = !document.body.classList.contains('side-collapsed');
+          applyCollapsed(collapsed);
+          try {
+            localStorage.setItem(storageKey, collapsed ? '1' : '0');
+          } catch (error) {
+          }
+        }
+
+        function onResize() {
+          var preferredCollapsed = false;
+          try {
+            preferredCollapsed = localStorage.getItem(storageKey) === '1';
+          } catch (error) {
+            preferredCollapsed = false;
+          }
+          applyCollapsed(preferredCollapsed);
+        }
+
+        var startCollapsed = false;
+        try {
+          startCollapsed = localStorage.getItem(storageKey) === '1';
+        } catch (error) {
+          startCollapsed = false;
+        }
+        applyCollapsed(startCollapsed);
+        window.requestAnimationFrame(function () {
+          document.body.classList.remove('side-state-preload');
+        });
+
+        toggleBtn.addEventListener('click', onToggleClick);
+        window.addEventListener('resize', onResize);
+
+        sideToggleCleanup = function () {
+          toggleBtn.removeEventListener('click', onToggleClick);
+          window.removeEventListener('resize', onResize);
         };
       }
 
@@ -4161,7 +6651,8 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
         if (form) {
           [
             'customer_id', 'numero_cotizacion', 'fecha_emision', 'validez_dias', 'estado',
-            'descuento_pct', 'terminos_condiciones_adicionales', 'observaciones'
+            'descuento_pct', 'validez_override', 'entrega_override', 'condicion_de_pago_override',
+            'moneda_override', 'terminos_condiciones_adicionales', 'observaciones'
           ].forEach(function (fieldName) {
             var field = form.querySelector('[name="' + fieldName + '"]');
             quoteInitialValues[fieldName] = field ? field.value : '';
@@ -4225,17 +6716,110 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
         function createItemRow(itemData) {
           var data = itemData || {};
           var desc = String(data.descripcion || '');
-          var qty = String(data.cantidad || '1');
-          var price = String(data.precio || '0');
+          var itemType = String(data.tipo || 'normal').toLowerCase() === 'text' ? 'text' : 'normal';
+          var qty = Object.prototype.hasOwnProperty.call(data, 'cantidad') ? String(data.cantidad) : '1';
+          var price = Object.prototype.hasOwnProperty.call(data, 'precio') ? String(data.precio) : '0';
+          if (itemType !== 'text') {
+            if (qty.trim() === '' || Number(qty) <= 0) {
+              qty = '1';
+            }
+            if (price.trim() === '' || !isFinite(Number(price)) || Number(price) < 0) {
+              price = '0';
+            }
+          }
+          var isBold = String(data.negrita || '0') === '1';
           var tr = document.createElement('tr');
+          tr.setAttribute('data-item-row', '1');
+          tr.setAttribute('data-item-type', itemType);
+          tr.setAttribute('data-item-bold', isBold ? '1' : '0');
           tr.innerHTML = [
-            '<td><input type="text" name="item_descripcion[]" value="' + escapeHtml(desc) + '" required></td>',
-            '<td><input type="number" name="item_cantidad[]" value="' + escapeHtml(qty) + '" min="0.01" step="0.01" data-item-cantidad="1" required></td>',
-            '<td><input type="number" name="item_precio[]" value="' + escapeHtml(price) + '" min="0" step="0.01" data-item-precio="1" required></td>',
+            '<td>' +
+              '<input type="text" name="item_descripcion[]" value="' + escapeHtml(desc) + '" data-item-descripcion="1" required>' +
+              '<input type="hidden" name="item_tipo[]" value="' + escapeHtml(itemType) + '" data-item-type-input="1">' +
+              '<input type="hidden" name="item_negrita[]" value="' + (isBold ? '1' : '0') + '" data-item-bold-input="1">' +
+            '</td>',
+            '<td>' +
+              '<input type="number" name="item_cantidad[]" value="' + escapeHtml(qty) + '" min="0.01" step="0.01" data-item-cantidad="1" required>' +
+              '<span class="item-dash" data-item-dash="qty" style="display:none;">-</span>' +
+            '</td>',
+            '<td>' +
+              '<input type="number" name="item_precio[]" value="' + escapeHtml(price) + '" min="0" step="0.01" data-item-precio="1" required>' +
+              '<span class="item-dash" data-item-dash="price" style="display:none;">-</span>' +
+            '</td>',
             '<td><span class="line-total" data-line-total="1">$0</span></td>',
+            '<td>' +
+              '<div class="item-style-tools">' +
+                '<button class="btn item-style-btn' + (isBold ? ' active' : '') + '" type="button" data-item-bold-toggle="1" title="Negrita">N</button>' +
+                '<button class="btn item-style-btn' + (itemType === 'text' ? ' active' : '') + '" type="button" data-item-type-toggle="1" title="Texto sin precio">T</button>' +
+              '</div>' +
+            '</td>',
             '<td><button class="btn danger" type="button" data-quote-remove-item="1">X</button></td>'
           ].join('');
+          syncItemRowState(tr);
           return tr;
+        }
+
+        function syncItemRowState(row) {
+          if (!row) {
+            return;
+          }
+          var typeInput = row.querySelector('[data-item-type-input="1"]');
+          var boldInput = row.querySelector('[data-item-bold-input="1"]');
+          var qtyInput = row.querySelector('[data-item-cantidad="1"]');
+          var priceInput = row.querySelector('[data-item-precio="1"]');
+          var qtyDash = row.querySelector('[data-item-dash="qty"]');
+          var priceDash = row.querySelector('[data-item-dash="price"]');
+          var boldBtn = row.querySelector('[data-item-bold-toggle="1"]');
+          var typeBtn = row.querySelector('[data-item-type-toggle="1"]');
+
+          var itemType = typeInput && String(typeInput.value).toLowerCase() === 'text' ? 'text' : 'normal';
+          var isBold = boldInput && String(boldInput.value) === '1';
+
+          row.setAttribute('data-item-type', itemType);
+          row.setAttribute('data-item-bold', isBold ? '1' : '0');
+
+          if (qtyInput) {
+            qtyInput.disabled = false;
+            qtyInput.readOnly = itemType === 'text';
+            qtyInput.required = itemType !== 'text';
+            qtyInput.style.display = itemType === 'text' ? 'none' : '';
+            if (itemType === 'text') {
+              qtyInput.value = '';
+            }
+            if (itemType !== 'text') {
+              var qtyVal = Number(qtyInput.value);
+              if (!isFinite(qtyVal) || qtyVal <= 0) {
+                qtyInput.value = '1';
+              }
+            }
+          }
+          if (priceInput) {
+            priceInput.disabled = false;
+            priceInput.readOnly = itemType === 'text';
+            priceInput.required = itemType !== 'text';
+            priceInput.style.display = itemType === 'text' ? 'none' : '';
+            if (itemType === 'text') {
+              priceInput.value = '';
+            }
+            if (itemType !== 'text') {
+              var priceVal = Number(priceInput.value);
+              if (!isFinite(priceVal) || priceVal < 0) {
+                priceInput.value = '0';
+              }
+            }
+          }
+          if (qtyDash) {
+            qtyDash.style.display = itemType === 'text' ? '' : 'none';
+          }
+          if (priceDash) {
+            priceDash.style.display = itemType === 'text' ? '' : 'none';
+          }
+          if (boldBtn) {
+            boldBtn.classList.toggle('active', isBold);
+          }
+          if (typeBtn) {
+            typeBtn.classList.toggle('active', itemType === 'text');
+          }
         }
 
         function escapeHtml(value) {
@@ -4259,6 +6843,10 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             'validez_dias',
             'estado',
             'descuento_pct',
+            'validez_override',
+            'entrega_override',
+            'condicion_de_pago_override',
+            'moneda_override',
             'terminos_condiciones_adicionales',
             'observaciones'
           ];
@@ -4303,9 +6891,18 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
           var subtotal = 0;
           var rows = itemsBody.querySelectorAll('tr');
           rows.forEach(function (row) {
+            syncItemRowState(row);
+            var typeInput = row.querySelector('[data-item-type-input="1"]');
+            var itemType = typeInput && String(typeInput.value).toLowerCase() === 'text' ? 'text' : 'normal';
             var qtyInput = row.querySelector('[data-item-cantidad="1"]');
             var priceInput = row.querySelector('[data-item-precio="1"]');
             var lineLabel = row.querySelector('[data-line-total="1"]');
+            if (itemType === 'text') {
+              if (lineLabel) {
+                lineLabel.textContent = '-';
+              }
+              return;
+            }
             var qty = qtyInput ? Number(qtyInput.value) : 0;
             var price = priceInput ? Number(priceInput.value) : 0;
             if (!isFinite(qty) || qty < 0) {
@@ -4356,6 +6953,53 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
         }
 
         function onItemsClick(event) {
+          var boldBtn = event.target.closest('[data-item-bold-toggle="1"]');
+          if (boldBtn && itemsBody) {
+            var boldRow = boldBtn.closest('tr');
+            if (boldRow) {
+              var boldInput = boldRow.querySelector('[data-item-bold-input="1"]');
+              if (boldInput) {
+                boldInput.value = String(boldInput.value) === '1' ? '0' : '1';
+                syncItemRowState(boldRow);
+              }
+            }
+            return;
+          }
+
+          var typeBtn = event.target.closest('[data-item-type-toggle="1"]');
+          if (typeBtn && itemsBody) {
+            var typeRow = typeBtn.closest('tr');
+            if (typeRow) {
+              var typeInput = typeRow.querySelector('[data-item-type-input="1"]');
+              var qtyInput = typeRow.querySelector('[data-item-cantidad="1"]');
+              var priceInput = typeRow.querySelector('[data-item-precio="1"]');
+              if (typeInput) {
+                var wasText = String(typeInput.value).toLowerCase() === 'text';
+                typeInput.value = wasText ? 'normal' : 'text';
+                if (wasText) {
+                  if (qtyInput) {
+                    var qtyNum = Number(qtyInput.value);
+                    qtyInput.value = (!isFinite(qtyNum) || qtyNum <= 0) ? '1' : String(qtyNum);
+                  }
+                  if (priceInput) {
+                    var priceNum = Number(priceInput.value);
+                    priceInput.value = (!isFinite(priceNum) || priceNum < 0) ? '0' : String(priceNum);
+                  }
+                } else {
+                  if (qtyInput) {
+                    qtyInput.value = '';
+                  }
+                  if (priceInput) {
+                    priceInput.value = '';
+                  }
+                }
+                syncItemRowState(typeRow);
+                refreshTotals();
+              }
+            }
+            return;
+          }
+
           var removeBtn = event.target.closest('[data-quote-remove-item="1"]');
           if (!removeBtn || !itemsBody) {
             return;
@@ -4440,6 +7084,106 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
           }
           if (addItemButton) {
             addItemButton.removeEventListener('click', onAddItem);
+          }
+        };
+      }
+
+      function bindQuoteEmailModal() {
+        if (typeof quoteEmailCleanup === 'function') {
+          quoteEmailCleanup();
+          quoteEmailCleanup = null;
+        }
+
+        var emailModal = document.getElementById('quoteEmailModal');
+        if (!emailModal) {
+          return;
+        }
+
+        var triggerButtons = document.querySelectorAll('[data-open-quote-email="1"]');
+        var closeButtons = emailModal.querySelectorAll('[data-close-quote-email="1"]');
+        var idInput = emailModal.querySelector('[data-quote-email-id="1"]');
+        var toInput = emailModal.querySelector('[data-quote-email-to="1"]');
+        var subjectInput = emailModal.querySelector('[data-quote-email-subject="1"]');
+        var messageInput = emailModal.querySelector('[data-quote-email-message="1"]');
+        var metaLabel = emailModal.querySelector('[data-quote-email-meta="1"]');
+        var defaultMessage = messageInput ? messageInput.value : '';
+
+        function openModal() {
+          emailModal.classList.add('open');
+          emailModal.setAttribute('aria-hidden', 'false');
+          if (toInput) {
+            toInput.focus();
+          }
+        }
+
+        function closeModal() {
+          emailModal.classList.remove('open');
+          emailModal.setAttribute('aria-hidden', 'true');
+        }
+
+        function onBackdropClick(event) {
+          if (event.target === emailModal) {
+            closeModal();
+          }
+        }
+
+        function onEsc(event) {
+          if (event.key === 'Escape' && emailModal.classList.contains('open')) {
+            closeModal();
+          }
+        }
+
+        function onOpenClick(event) {
+          var button = event.currentTarget;
+          var quoteId = button.getAttribute('data-quote-id') || '';
+          var quoteNumber = button.getAttribute('data-quote-number') || '';
+          var customerName = button.getAttribute('data-customer-name') || '';
+          var customerEmail = button.getAttribute('data-customer-email') || '';
+          var printUrl = button.getAttribute('data-print-url') || '';
+
+          if (idInput) {
+            idInput.value = quoteId;
+          }
+          if (toInput) {
+            toInput.value = customerEmail;
+          }
+          if (subjectInput) {
+            subjectInput.value = quoteNumber ? ('Cotizacion ' + quoteNumber + ' - GesMan HERMES') : 'Cotizacion GesMan HERMES';
+          }
+          if (messageInput) {
+            var hello = customerName ? ('Hola ' + customerName + ',') : 'Hola,';
+            messageInput.value = hello + '\n\nTe compartimos la cotizacion ' + quoteNumber + '.\n\nQuedo atento a tus comentarios.';
+          }
+          if (metaLabel) {
+            metaLabel.textContent = printUrl
+              ? ('Se incluira tambien el enlace a la vista imprimible: ' + printUrl)
+              : 'Se incluira tambien el enlace a la vista imprimible de la cotizacion.';
+          }
+
+          openModal();
+        }
+
+        triggerButtons.forEach(function (button) {
+          button.addEventListener('click', onOpenClick);
+        });
+        closeButtons.forEach(function (button) {
+          button.addEventListener('click', closeModal);
+        });
+
+        emailModal.addEventListener('click', onBackdropClick);
+        document.addEventListener('keydown', onEsc);
+
+        quoteEmailCleanup = function () {
+          triggerButtons.forEach(function (button) {
+            button.removeEventListener('click', onOpenClick);
+          });
+          closeButtons.forEach(function (button) {
+            button.removeEventListener('click', closeModal);
+          });
+          emailModal.removeEventListener('click', onBackdropClick);
+          document.removeEventListener('keydown', onEsc);
+          if (messageInput && messageInput.value === '') {
+            messageInput.value = defaultMessage;
           }
         };
       }
@@ -4577,27 +7321,46 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
 
         var openButtons = document.querySelectorAll('[data-open-delete-confirm="1"]');
         var closeButtons = modal.querySelectorAll('[data-close-delete-confirm="1"]');
+        var title = modal.querySelector('[data-delete-confirm-title="1"]');
         var description = modal.querySelector('[data-delete-confirm-description="1"]');
         var stepOne = modal.querySelector('[data-delete-step-one="1"]');
+        var stepOneText = modal.querySelector('[data-delete-step-one-text="1"]');
         var stepTwo = modal.querySelector('[data-delete-step-two="1"]');
+        var stepTwoText = modal.querySelector('[data-delete-step-two-text="1"]');
+        var checkWrap = modal.querySelector('[data-delete-check-wrap="1"]');
+        var checkText = modal.querySelector('[data-delete-check-text="1"]');
         var goStepTwoButton = modal.querySelector('[data-delete-go-step-two="1"]');
         var backStepOneButton = modal.querySelector('[data-delete-back-step-one="1"]');
-        var input = modal.querySelector('[data-delete-confirm-input="1"]');
+        var confirmCheckbox = modal.querySelector('[data-delete-confirm-checkbox="1"]');
         var submitButton = modal.querySelector('[data-delete-submit="1"]');
+        var submitLabel = modal.querySelector('[data-delete-submit-label="1"]');
 
         var pendingAction = '';
         var pendingIdField = '';
         var pendingIdValue = '';
+        var pendingMode = 'trash';
 
-        function resetState() {
-          pendingAction = '';
-          pendingIdField = '';
-          pendingIdValue = '';
-          if (input) {
-            input.value = '';
+        function resetState(clearPending) {
+          if (clearPending) {
+            pendingAction = '';
+            pendingIdField = '';
+            pendingIdValue = '';
+            pendingMode = 'trash';
+          }
+          if (confirmCheckbox) {
+            confirmCheckbox.checked = false;
           }
           if (submitButton) {
             submitButton.disabled = true;
+          }
+          if (goStepTwoButton) {
+            goStepTwoButton.textContent = 'Continuar';
+          }
+          if (backStepOneButton) {
+            backStepOneButton.style.display = '';
+          }
+          if (checkWrap) {
+            checkWrap.style.display = 'flex';
           }
           if (stepOne) {
             stepOne.style.display = 'block';
@@ -4611,16 +7374,80 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
           pendingAction = button.getAttribute('data-delete-action') || '';
           pendingIdField = button.getAttribute('data-delete-id-field') || '';
           pendingIdValue = button.getAttribute('data-delete-id-value') || '';
+          pendingMode = button.getAttribute('data-delete-mode') || 'trash';
+          resetState(false);
 
           var entity = button.getAttribute('data-delete-entity') || 'registro';
           var desc = button.getAttribute('data-delete-description') || '';
-          if (description) {
-            description.textContent = desc !== ''
-              ? 'Se eliminara el ' + entity + ': ' + desc + '. Esta accion no se puede deshacer.'
-              : 'Se eliminara este ' + entity + '. Esta accion no se puede deshacer.';
+
+          if (pendingMode === 'trash') {
+            if (title) {
+              title.textContent = 'Mover a la papelera';
+            }
+            if (description) {
+              description.textContent = desc !== ''
+                ? 'Se movera el ' + entity + ': ' + desc + ' a la papelera de reciclaje. Podras eliminarlo de forma definitiva desde el modulo Papelera.'
+                : 'Se movera este ' + entity + ' a la papelera de reciclaje. Podras eliminarlo de forma definitiva desde el modulo Papelera.';
+            }
+            if (stepOneText) {
+              stepOneText.textContent = 'Primer paso: confirma que deseas mover este elemento a la papelera de reciclaje.';
+            }
+            if (stepTwoText) {
+              stepTwoText.textContent = '';
+            }
+            if (checkWrap) {
+              checkWrap.style.display = 'none';
+            }
+            if (goStepTwoButton) {
+              goStepTwoButton.textContent = 'Mover a papelera';
+            }
+            if (submitLabel) {
+              submitLabel.textContent = 'Confirmar movimiento';
+            }
+          } else if (pendingMode === 'restore') {
+            if (title) {
+              title.textContent = 'Restaurar desde papelera';
+            }
+            if (description) {
+              description.textContent = desc !== ''
+                ? 'Se restaurara el ' + entity + ': ' + desc + ' y volvera a estar disponible en los modulos activos.'
+                : 'Se restaurara este ' + entity + ' y volvera a estar disponible en los modulos activos.';
+            }
+            if (stepOneText) {
+              stepOneText.textContent = 'Primer paso: confirma que deseas restaurar este elemento desde la papelera.';
+            }
+            if (stepTwoText) {
+              stepTwoText.textContent = 'Segundo paso: marca la casilla de acuerdo para habilitar la restauracion.';
+            }
+            if (checkText) {
+              checkText.textContent = 'Estoy de acuerdo con restaurar este dato.';
+            }
+            if (submitLabel) {
+              submitLabel.textContent = 'Confirmar restauracion';
+            }
+          } else {
+            if (title) {
+              title.textContent = 'Eliminacion definitiva';
+            }
+            if (description) {
+              description.textContent = desc !== ''
+                ? 'Se eliminara definitivamente el ' + entity + ': ' + desc + '. Esta accion es irreversible y puede eliminar datos relacionados. Al continuar, aceptas que no podras reclamar por la recuperacion de datos relacionados eliminados.'
+                : 'Se eliminara definitivamente este ' + entity + '. Esta accion es irreversible y puede eliminar datos relacionados. Al continuar, aceptas que no podras reclamar por la recuperacion de datos relacionados eliminados.';
+            }
+            if (stepOneText) {
+              stepOneText.textContent = 'Primer paso: confirma que entiendes la eliminacion definitiva e irreversible.';
+            }
+            if (stepTwoText) {
+              stepTwoText.textContent = 'Segundo paso: marca la casilla de acuerdo para habilitar la eliminacion definitiva.';
+            }
+            if (checkText) {
+              checkText.textContent = 'Estoy de acuerdo con borrar este dato y los relacionados que correspondan.';
+            }
+            if (submitLabel) {
+              submitLabel.textContent = 'Confirmar eliminacion definitiva';
+            }
           }
 
-          resetState();
           modal.classList.add('open');
           modal.setAttribute('aria-hidden', 'false');
         }
@@ -4628,7 +7455,7 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
         function closeModal() {
           modal.classList.remove('open');
           modal.setAttribute('aria-hidden', 'true');
-          resetState();
+          resetState(true);
         }
 
         function submitDelete() {
@@ -4667,11 +7494,11 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
           }
         }
 
-        function onInputChange() {
-          if (!submitButton || !input) {
+        function onCheckboxChange() {
+          if (!submitButton || !confirmCheckbox) {
             return;
           }
-          submitButton.disabled = input.value.trim().toUpperCase() !== 'ELIMINAR';
+          submitButton.disabled = !confirmCheckbox.checked;
         }
 
         function onOpenClick(event) {
@@ -4679,14 +7506,18 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
         }
 
         function goStepTwo() {
+          if (pendingMode === 'trash') {
+            submitDelete();
+            return;
+          }
           if (stepOne) {
             stepOne.style.display = 'none';
           }
           if (stepTwo) {
             stepTwo.style.display = 'block';
           }
-          if (input) {
-            input.focus();
+          if (confirmCheckbox) {
+            confirmCheckbox.focus();
           }
         }
 
@@ -4697,8 +7528,8 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
           if (stepTwo) {
             stepTwo.style.display = 'none';
           }
-          if (input) {
-            input.value = '';
+          if (confirmCheckbox) {
+            confirmCheckbox.checked = false;
           }
           if (submitButton) {
             submitButton.disabled = true;
@@ -4720,8 +7551,8 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
         if (submitButton) {
           submitButton.addEventListener('click', submitDelete);
         }
-        if (input) {
-          input.addEventListener('input', onInputChange);
+        if (confirmCheckbox) {
+          confirmCheckbox.addEventListener('change', onCheckboxChange);
         }
         modal.addEventListener('click', onBackdropClick);
         document.addEventListener('keydown', onEsc);
@@ -4742,8 +7573,8 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
           if (submitButton) {
             submitButton.removeEventListener('click', submitDelete);
           }
-          if (input) {
-            input.removeEventListener('input', onInputChange);
+          if (confirmCheckbox) {
+            confirmCheckbox.removeEventListener('change', onCheckboxChange);
           }
           modal.removeEventListener('click', onBackdropClick);
           document.removeEventListener('keydown', onEsc);
@@ -4832,10 +7663,13 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
           updateActiveMenuFromDoc(nextDoc);
           bindCustomerModal();
           bindQuoteModal();
+          bindQuoteEmailModal();
           bindQuotePreview();
           bindDeleteConfirmModal();
           bindQuoteFilters();
           bindQuoteQuickState();
+          bindToasts();
+          bindSideMenuToggle();
 
           if (pushState) {
             history.pushState({ moduleUrl: targetUrl.toString() }, '', targetUrl.toString());
@@ -4883,10 +7717,162 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
 
       bindCustomerModal();
       bindQuoteModal();
+      bindQuoteEmailModal();
       bindQuotePreview();
       bindDeleteConfirmModal();
       bindQuoteFilters();
       bindQuoteQuickState();
+      bindToasts();
+      bindSideMenuToggle();
+    })();
+  </script>
+  <style>
+    .idle-warning-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(3, 10, 28, 0.72);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      padding: 16px;
+    }
+    .idle-warning-overlay.visible {
+      display: flex;
+    }
+    .idle-warning-box {
+      width: min(480px, 100%);
+      background: #ffffff;
+      border-radius: 14px;
+      border: 1px solid #d7def0;
+      padding: 20px;
+      box-shadow: 0 18px 55px rgba(9, 15, 35, 0.3);
+    }
+    .idle-warning-box h3 {
+      margin: 0 0 10px;
+      color: #111f43;
+    }
+    .idle-warning-box p {
+      margin: 0;
+      color: #344266;
+      line-height: 1.45;
+    }
+    .idle-warning-actions {
+      margin-top: 16px;
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+    .idle-warning-actions .btn {
+      min-width: 130px;
+    }
+  </style>
+  <div class="idle-warning-overlay" id="idleWarning" aria-live="polite" aria-hidden="true">
+    <div class="idle-warning-box" role="dialog" aria-modal="true" aria-labelledby="idleWarningTitle">
+      <h3 id="idleWarningTitle">Tu sesion esta por expirar</h3>
+      <p>
+        Por seguridad, tu sesion se cerrara por inactividad en
+        <strong id="idleWarningCountdown">05:00</strong>.
+      </p>
+      <div class="idle-warning-actions">
+        <button class="btn" type="button" id="idleStaySigned">Seguir en sesion</button>
+        <button class="btn ghost" type="button" id="idleLeaveNow">Cerrar ahora</button>
+      </div>
+    </div>
+  </div>
+  <script>
+    (function () {
+      var warningMs = <?= (int)$sessionWarningSeconds ?> * 1000;
+      var expiresAtMs = <?= (int)$sessionExpiresAt ?> * 1000;
+
+      var overlay = document.getElementById('idleWarning');
+      var countdown = document.getElementById('idleWarningCountdown');
+      var keepAliveBtn = document.getElementById('idleStaySigned');
+      var leaveBtn = document.getElementById('idleLeaveNow');
+
+      if (!overlay || !countdown || !keepAliveBtn || !leaveBtn) {
+        return;
+      }
+
+      function formatCountdown(ms) {
+        var total = Math.max(0, Math.ceil(ms / 1000));
+        var minutes = Math.floor(total / 60);
+        var seconds = total % 60;
+        return String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
+      }
+
+      function showWarning() {
+        overlay.classList.add('visible');
+        overlay.setAttribute('aria-hidden', 'false');
+      }
+
+      function hideWarning() {
+        overlay.classList.remove('visible');
+        overlay.setAttribute('aria-hidden', 'true');
+      }
+
+      function redirectToLogin() {
+        window.location.href = '/login/?session_timeout=1';
+      }
+
+      async function keepSessionAlive() {
+        keepAliveBtn.disabled = true;
+        try {
+          var url = new URL(window.location.href);
+          url.searchParams.set('keepalive', '1');
+          var res = await fetch(url.toString(), {
+            method: 'GET',
+            credentials: 'same-origin',
+            cache: 'no-store',
+            headers: { 'Accept': 'application/json' }
+          });
+          if (!res.ok) {
+            redirectToLogin();
+            return;
+          }
+          var payload = await res.json();
+          if (!payload || payload.ok !== true || typeof payload.expires_at !== 'number') {
+            redirectToLogin();
+            return;
+          }
+          expiresAtMs = payload.expires_at * 1000;
+          hideWarning();
+        } catch (err) {
+          redirectToLogin();
+        } finally {
+          keepAliveBtn.disabled = false;
+        }
+      }
+
+      keepAliveBtn.addEventListener('click', function () {
+        void keepSessionAlive();
+      });
+
+      leaveBtn.addEventListener('click', function () {
+        redirectToLogin();
+      });
+
+      window.setInterval(function () {
+        var remaining = expiresAtMs - Date.now();
+        if (remaining <= 0) {
+          redirectToLogin();
+          return;
+        }
+
+        if (remaining <= warningMs) {
+          showWarning();
+          countdown.textContent = formatCountdown(remaining);
+        } else {
+          hideWarning();
+        }
+      }, 1000);
+
+      document.addEventListener('visibilitychange', function () {
+        if (!document.hidden && (expiresAtMs - Date.now()) <= warningMs) {
+          countdown.textContent = formatCountdown(expiresAtMs - Date.now());
+          showWarning();
+        }
+      });
     })();
   </script>
 </body>
