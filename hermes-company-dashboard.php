@@ -5724,6 +5724,12 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             } elseif (in_array($currentPlanCodeUi, ['semidios', 'enterprise'], true)) {
               $currentPlanCodeUi = 'enterprise';
             }
+            $planRankUi = [
+              'basico' => 1,
+              'pro' => 2,
+              'enterprise' => 3,
+            ];
+            $currentPlanRankUi = (int)($planRankUi[$currentPlanCodeUi] ?? 1);
             $planToneUi = $isPlanPaidUi ? 'ok' : 'warn';
             $planTitleUi = $isPlanPaidUi ? 'Plan pagado' : 'Pago pendiente';
             if ($planBilling['days_left'] === null) {
@@ -5794,7 +5800,9 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             <article class="plan-upgrade-item">
               <h4>Plan Mortal</h4>
               <p>Pago del plan base para mantener operacion y renovacion al dia.</p>
-              <?php if ($isPlanUpToDateUi && $currentPlanCodeUi === 'basico'): ?>
+              <?php if ($currentPlanRankUi > 1): ?>
+                <span class="plan-pay-link disabled">Plan inferior al actual</span>
+              <?php elseif ($isPlanUpToDateUi && $currentPlanCodeUi === 'basico'): ?>
                 <span class="plan-pay-link disabled">Cliente al dia</span>
               <?php elseif ($planUpgradeLinks['basico'] !== ''): ?>
                 <a class="plan-pay-link" href="<?= h($planUpgradeLinks['basico']) ?>">Ir a pago Mortal</a>
@@ -5806,7 +5814,9 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             <article class="plan-upgrade-item">
               <h4>Plan Heroe</h4>
               <p>Escala capacidades operativas con funciones extendidas y usuarios tecnicos.</p>
-              <?php if ($isPlanUpToDateUi && $currentPlanCodeUi === 'pro'): ?>
+              <?php if ($currentPlanRankUi > 2): ?>
+                <span class="plan-pay-link disabled">Plan inferior al actual</span>
+              <?php elseif ($isPlanUpToDateUi && $currentPlanCodeUi === 'pro'): ?>
                 <span class="plan-pay-link disabled">Cliente al dia</span>
               <?php elseif ($planUpgradeLinks['pro'] !== ''): ?>
                 <a class="plan-pay-link alt" href="<?= h($planUpgradeLinks['pro']) ?>">Subir a Heroe</a>
