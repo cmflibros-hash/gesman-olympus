@@ -54,7 +54,7 @@ if (isset($_GET['keepalive']) && (string)$_GET['keepalive'] === '1') {
 $sessionExpiresAt = (int)$sessionActivity['expires_at'];
 
 $module = (string)($_GET['module'] ?? 'dashboard');
-if (!in_array($module, ['dashboard', 'plan', 'empresa', 'clientes', 'cotizaciones', 'papelera', 'configuracion'], true)) {
+if (!in_array($module, ['dashboard', 'plan', 'empresa', 'clientes', 'cotizaciones', 'papelera', 'configuracion', 'inventario', 'ordenes-servicio', 'reportes', 'tecnicos', 'carta-gantt'], true)) {
     $module = 'dashboard';
 }
 
@@ -954,7 +954,7 @@ function logo_public_url($relativePath)
 
   function dashboard_module_url($module)
   {
-    $safe = in_array($module, ['dashboard', 'plan', 'empresa', 'clientes', 'cotizaciones', 'papelera', 'configuracion'], true) ? $module : 'dashboard';
+    $safe = in_array($module, ['dashboard', 'plan', 'empresa', 'clientes', 'cotizaciones', 'papelera', 'configuracion', 'inventario', 'ordenes-servicio', 'reportes', 'tecnicos', 'carta-gantt'], true) ? $module : 'dashboard';
     return '/empresa/dashboard/?module=' . rawurlencode($safe);
   }
 
@@ -1218,7 +1218,7 @@ $quoteEmailForm = [
     $postback = $_SESSION['hermes_company_postback'];
     unset($_SESSION['hermes_company_postback']);
 
-    if (isset($postback['module']) && in_array((string)$postback['module'], ['dashboard', 'plan', 'empresa', 'clientes', 'cotizaciones', 'papelera', 'configuracion'], true)) {
+    if (isset($postback['module']) && in_array((string)$postback['module'], ['dashboard', 'plan', 'empresa', 'clientes', 'cotizaciones', 'papelera', 'configuracion', 'inventario', 'ordenes-servicio', 'reportes', 'tecnicos', 'carta-gantt'], true)) {
       $module = (string)$postback['module'];
     }
     if (isset($postback['flash']) && is_array($postback['flash'])) {
@@ -3285,6 +3285,14 @@ try {
     if ($quoteForm['numero_cotizacion'] === '') {
       $quoteForm['numero_cotizacion'] = next_quote_number($pdo, $tenantCompanyId);
     }
+
+    $heroeOnlyModules = ['inventario', 'ordenes-servicio', 'reportes', 'tecnicos', 'carta-gantt'];
+    $currentPlanForModules = normalize_plan_code((string)$usage['plan_code'], 'basico');
+    $canAccessHeroeModules = in_array($currentPlanForModules, ['pro', 'enterprise', 'olimpico'], true);
+    if (in_array($module, $heroeOnlyModules, true) && !$canAccessHeroeModules) {
+      $flash['error'] = 'Tu plan actual no incluye este modulo. Actualiza a Heroe o superior para habilitarlo.';
+      $module = 'plan';
+    }
 } catch (Throwable $e) {
     error_log('HERMES_COMPANY_DASHBOARD_ERROR: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
     $flash['error'] = 'No fue posible cargar el panel de empresa por un error de base de datos.';
@@ -3292,6 +3300,9 @@ try {
 
 $bodyClass = 'module-' . $module;
 $quoteEmbed = isset($_GET['quote_embed']) && (string)$_GET['quote_embed'] === '1';
+$heroeOnlyModules = ['inventario', 'ordenes-servicio', 'reportes', 'tecnicos', 'carta-gantt'];
+$currentPlanForModules = normalize_plan_code((string)$usage['plan_code'], 'basico');
+$canAccessHeroeModules = in_array($currentPlanForModules, ['pro', 'enterprise', 'olimpico'], true);
 
 if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePreview)) {
     ?>
@@ -5542,6 +5553,38 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             <svg viewBox="0 0 16 16"><path d="M2.5 3.5h11v9h-11zM5 6.2h6M5 8.5h6M5 10.8h3.6"/></svg>
           </span>
         </a>
+        <?php if ($canAccessHeroeModules): ?>
+          <a class="<?= $module === 'inventario' ? 'active' : '' ?>" href="/empresa/dashboard/?module=inventario">
+            <span>Inventario</span>
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 16 16"><path d="M2.5 4.5 8 2l5.5 2.5V12L8 14 2.5 12zM8 2v12M2.5 4.5 8 7l5.5-2.5"/></svg>
+            </span>
+          </a>
+          <a class="<?= $module === 'ordenes-servicio' ? 'active' : '' ?>" href="/empresa/dashboard/?module=ordenes-servicio">
+            <span>Ordenes de servicio</span>
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 16 16"><path d="M3 2.5h10v11H3zM5 5h6M5 7.5h6M5 10h4"/></svg>
+            </span>
+          </a>
+          <a class="<?= $module === 'reportes' ? 'active' : '' ?>" href="/empresa/dashboard/?module=reportes">
+            <span>Reportes</span>
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 16 16"><path d="M2.5 13.5h11M4 12V8.5M7 12V5.5M10 12V7M13 12V4"/></svg>
+            </span>
+          </a>
+          <a class="<?= $module === 'tecnicos' ? 'active' : '' ?>" href="/empresa/dashboard/?module=tecnicos">
+            <span>Tecnicos</span>
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 16 16"><path d="M8 2.5a2 2 0 1 1 0 4 2 2 0 0 1 0-4ZM3.2 13.5v-.8c0-1.8 1.5-3.2 3.3-3.2h3c1.8 0 3.3 1.4 3.3 3.2v.8"/></svg>
+            </span>
+          </a>
+          <a class="<?= $module === 'carta-gantt' ? 'active' : '' ?>" href="/empresa/dashboard/?module=carta-gantt">
+            <span>Carta Gantt</span>
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 16 16"><path d="M2.5 3.5h11v9h-11zM4 5.5h3v2H4zM8 8.5h4v2H8zM6 11.5h5"/></svg>
+            </span>
+          </a>
+        <?php endif; ?>
       </nav>
       <div class="side-toggle-wrap">
         <button class="side-toggle" type="button" data-side-toggle="1" aria-label="Contraer menu" aria-expanded="true" title="Contraer menu">
@@ -5970,6 +6013,61 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
               </table>
             </div>
           <?php endif; ?>
+        </section>
+      <?php endif; ?>
+
+      <?php if ($module === 'inventario'): ?>
+        <section class="panel compact">
+          <h2 style="margin-top:0;">Inventario</h2>
+          <p class="muted" style="margin-top:.25rem;">Modulo base del plan Heroe para controlar stock, movimientos y alertas de existencia.</p>
+          <div class="dash-plan-renew dash-plan-renew--ok" style="margin-top:.5rem;">
+            <strong>Modulo habilitado</strong>
+            <span>Seccion inicial creada. En el siguiente paso definimos estructura de productos, bodegas y movimientos.</span>
+          </div>
+        </section>
+      <?php endif; ?>
+
+      <?php if ($module === 'ordenes-servicio'): ?>
+        <section class="panel compact">
+          <h2 style="margin-top:0;">Ordenes de servicio</h2>
+          <p class="muted" style="margin-top:.25rem;">Modulo Heroe para planificar, asignar y dar seguimiento operativo a servicios en terreno o taller.</p>
+          <div class="dash-plan-renew dash-plan-renew--ok" style="margin-top:.5rem;">
+            <strong>Modulo habilitado</strong>
+            <span>Seccion inicial creada. En el siguiente paso modelamos estados, prioridades y flujo de atencion.</span>
+          </div>
+        </section>
+      <?php endif; ?>
+
+      <?php if ($module === 'reportes'): ?>
+        <section class="panel compact">
+          <h2 style="margin-top:0;">Reportes</h2>
+          <p class="muted" style="margin-top:.25rem;">Modulo Heroe para indicadores operativos y comerciales con filtros por fechas, clientes y tecnicos.</p>
+          <div class="dash-plan-renew dash-plan-renew--ok" style="margin-top:.5rem;">
+            <strong>Modulo habilitado</strong>
+            <span>Seccion inicial creada. En el siguiente paso definimos paneles, metricas y exportaciones.</span>
+          </div>
+        </section>
+      <?php endif; ?>
+
+      <?php if ($module === 'tecnicos'): ?>
+        <section class="panel compact">
+          <h2 style="margin-top:0;">Tecnicos</h2>
+          <p class="muted" style="margin-top:.25rem;">Modulo Heroe para gestionar cuadrillas, perfiles tecnicos y capacidades de asignacion.</p>
+          <div class="dash-plan-renew dash-plan-renew--ok" style="margin-top:.5rem;">
+            <strong>Modulo habilitado</strong>
+            <span>Seccion inicial creada. En el siguiente paso diseñamos ficha tecnica, disponibilidad y carga de trabajo.</span>
+          </div>
+        </section>
+      <?php endif; ?>
+
+      <?php if ($module === 'carta-gantt'): ?>
+        <section class="panel compact">
+          <h2 style="margin-top:0;">Carta Gantt</h2>
+          <p class="muted" style="margin-top:.25rem;">Modulo Heroe para calendarizar tareas y visualizar dependencias por ventanas de tiempo.</p>
+          <div class="dash-plan-renew dash-plan-renew--ok" style="margin-top:.5rem;">
+            <strong>Modulo habilitado</strong>
+            <span>Seccion inicial creada. En el siguiente paso construimos vista temporal, hitos y reprogramacion.</span>
+          </div>
         </section>
       <?php endif; ?>
 
