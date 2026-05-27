@@ -291,59 +291,360 @@ function smtp_send_data_payload($socket, $payload)
   return smtp_expect_code($response, [250]);
 }
 
-function build_quote_html_attachment($companyName, $previewUrl, array $quoteRow, array $quoteItems)
+function quote_pdf_escape_text($text)
+{
+  $raw = trim((string)$text);
+  $raw = preg_replace('/\s+/', ' ', (string)$raw);
+  $ascii = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $raw);
+  if (!is_string($ascii) || $ascii === '') {
+    $ascii = preg_replace('/[^\x20-\x7E]/', '', $raw);
+  }
+  $ascii = str_replace(['\\', '(', ')'], ['\\\\', '\\(', '\\)'], (string)$ascii);
+  return trim((string)$ascii);
+}
+
+function quote_pdf_wrap_line($text, $maxLen = 95)
+{
+  $line = trim((string)$text);
+  if ($line === '') {
+    return [''];
+  }
+
+  $words = preg_split('/\s+/', $line) ?: [];
+  $lines = [];
+  $current = '';
+
+  foreach ($words as $word) {
+    $candidate = ($current === '' ? $word : $current . ' ' . $word);
+    if (strlen($candidate) <= (int)$maxLen) {
+      $current = $candidate;
+    } else {
+      if ($current !== '') {
+        $lines[] = $current;
+      }
+      $current = $word;
+    }
+  }
+
+  if ($current !== '') {
+    $lines[] = $current;
+  }
+
+  return $lines;
+}
+
+function build_quote_preview_html_for_attachment(array $profile, $logoPublicUrl, array $quoteRow, array $quoteItems)
+{
+  $companyName = trim((string)($profile['nombre'] ?? ''));
+  if ($companyName === '') {
+    $companyName = 'GesMan HERMES';
+  }
+  $companyRut = trim((string)($profile['rut'] ?? ''));
+  $companyEmail = trim((string)($profile['email_principal'] ?? ''));
+  $companyAddress = trim((string)($profile['direccion'] ?? ''));
+  $companyPhone = trim((string)($profile['telefono'] ?? ''));
+
+  $quoteNumber = (string)($quoteRow['numero_cotizacion'] ?? '');
+  $quoteDate = (string)($quoteRow['fecha_emision'] ?? '');
+  $quoteState = (string)($quoteRow['estado'] ?? 'Pendiente');
+  $customerName = (string)($quoteRow['customer_name'] ?? '');
+  $customerRut = (string)($quoteRow['customer_rut'] ?? '');
+  $customerContact = (string)($quoteRow['customer_contact'] ?? '');
+  if ($customerContact === '') {
+    $customerContact = (string)($quoteRow['customer_contact_name'] ?? '');
+  }
+  $customerEmail = (string)($quoteRow['customer_email'] ?? '');
+
+  $validez = trim((string)($quoteRow['validez_override'] ?? ''));
+  if ($validez === '') {
+    $validez = trim((string)($profile['validez'] ?? ''));
+  }
+  if ($validez === '') {
+    $validez = ((int)($quoteRow['validez_dias'] ?? 15)) . ' dias';
+  }
+
+  $entrega = trim((string)($quoteRow['entrega_override'] ?? ''));
+  if ($entrega === '') {
+    $entrega = trim((string)($profile['entrega'] ?? ''));
+  }
+  if ($entrega === '') {
+    $entrega = 'No definida';
+  }
+
+  $condicionPago = trim((string)($quoteRow['condicion_de_pago_override'] ?? ''));
+  if ($condicionPago === '') {
+    $condicionPago = trim((string)($profile['condicion_de_pago'] ?? ''));
+  }
+  if ($condicionPago === '') {
+    $condicionPago = 'No definida';
+  }
+
+  $moneda = trim((string)($quoteRow['moneda_override'] ?? ''));
+  if ($moneda === '') {
+    $moneda = trim((string)($profile['moneda'] ?? ''));
+  }
+  if ($moneda === '') {
+    $moneda = 'CLP';
+  }
+
+  $money = quote_money_breakdown((float)($quoteRow['subtotal'] ?? 0), (float)($quoteRow['descuento_pct'] ?? 0));
+
+  ob_start();
+  ?>
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cotizacion <?= htmlspecialchars((string)$quoteNumber, ENT_QUOTES, 'UTF-8') ?></title>
+  <style>
+    @page { size: Letter; margin: 12mm; }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #fff;
+      height: 100%;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+    body {
+      font-family: Segoe UI, Arial, sans-serif;
+      color: #111827;
+    }
+    .page {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      background: #fff;
+      border: 0;
+      box-shadow: none;
+      padding: 0;
+    }
+    .page-content {
+      padding-bottom: 180px;
+    }
+    .head-table { width: 100%; border-collapse: collapse; margin-bottom: 14px; border-bottom: 2px solid #0f172a; }
+    .head-table > tbody > tr > td { vertical-align: top; padding: 0 8px 10px; border: 0; background: transparent; }
+    .head-table .col-logo { width: 200px; padding-left: 0; }
+    .head-table .col-quote { width: 200px; text-align: right; padding-right: 0; }
+    .quote-logo { max-height: 92px; max-width: 190px; width: auto; height: auto; display: block; }
+    .head-table h1 { margin: 0 0 4px; font-size: 18px; letter-spacing: .03em; line-height: 1.2; }
+    .muted { color: #4b5563; font-size: 13px; line-height: 1.3; }
+    .head-table .muted { font-size: 12px; }
+    .quote-doc-label { font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
+    .quote-doc-number { font-size: 18px; font-weight: 800; line-height: 1.15; color: #0f172a; word-break: break-word; margin-bottom: 4px; }
+    .info-table { width: 100%; border-collapse: separate; border-spacing: 12px 0; margin: 0 -12px 14px; table-layout: fixed; }
+    .info-table > tbody > tr > td { width: 50%; vertical-align: top; border: 1px solid #d1d5db; border-radius: 8px; padding: 10px; background: #fff; }
+    .info-table h3 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: #374151; }
+    table.items { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+    table.items th, table.items td { border: 1px solid #bfdbfe; padding: 7px; vertical-align: top; }
+    table.items th { background: #dbeafe; color: #1e3a8a; text-align: left; }
+    table.items tbody tr:nth-child(even) td { background: #f8fbff; }
+    .financials-table { width: 100%; border-collapse: separate; border-spacing: 10px 0; margin: 0 -10px; table-layout: fixed; position: absolute; left: 0; right: 0; bottom: 0; background: #fff; }
+    .financials-table > tbody > tr > td { vertical-align: top; padding: 0; }
+    .financials-table .col-terms { width: 60%; }
+    .financials-table .col-totals { width: 40%; }
+    .quote-terms-box, .totals-box { border: 1px solid #d1d5db; border-radius: 8px; background: #fff; min-height: 156px; }
+    .quote-terms-box { padding: 10px; }
+    .quote-terms-title { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: #374151; }
+    .quote-terms-content { white-space: pre-line; font-size: 12px; line-height: 1.3; color: #374151; margin-top: 6px; }
+    .totals { margin: 0; width: 100%; border-collapse: collapse; font-size: 13px; }
+    .totals td { font-weight: 600; padding: 8px 10px; border-bottom: 1px solid #e5e7eb; }
+    .totals tr:last-child td { font-size: 15px; background: #dbeafe; color: #1e3a8a; border-bottom: 0; }
+    .obs { margin-top: 14px; border: 1px solid #d1d5db; border-radius: 8px; padding: 10px; white-space: pre-line; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <article class="page">
+    <div class="page-content">
+    <table class="head-table">
+      <tbody>
+        <tr>
+          <td class="col-logo">
+            <?php if (trim((string)$logoPublicUrl) !== ''): ?>
+              <img class="quote-logo" src="<?= htmlspecialchars((string)$logoPublicUrl, ENT_QUOTES, 'UTF-8') ?>" alt="Logo empresa">
+            <?php endif; ?>
+          </td>
+          <td class="col-company">
+            <h1><?= htmlspecialchars($companyName, ENT_QUOTES, 'UTF-8') ?></h1>
+            <div class="muted">RUT: <?= htmlspecialchars($companyRut, ENT_QUOTES, 'UTF-8') ?></div>
+            <div class="muted">Email: <?= htmlspecialchars($companyEmail, ENT_QUOTES, 'UTF-8') ?></div>
+            <?php if ($companyAddress !== ''): ?><div class="muted">Direccion: <?= htmlspecialchars($companyAddress, ENT_QUOTES, 'UTF-8') ?></div><?php endif; ?>
+            <?php if ($companyPhone !== ''): ?><div class="muted">Telefono: <?= htmlspecialchars($companyPhone, ENT_QUOTES, 'UTF-8') ?></div><?php endif; ?>
+          </td>
+          <td class="col-quote">
+            <div class="quote-doc-label">Cotizacion</div>
+            <div class="quote-doc-number"><?= htmlspecialchars($quoteNumber, ENT_QUOTES, 'UTF-8') ?></div>
+            <div class="muted">Fecha: <?= htmlspecialchars($quoteDate, ENT_QUOTES, 'UTF-8') ?></div>
+            <div class="muted">Estado: <?= htmlspecialchars($quoteState, ENT_QUOTES, 'UTF-8') ?></div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <table class="info-table">
+      <tbody>
+        <tr>
+          <td>
+            <h3>Cliente</h3>
+            <div><strong><?= htmlspecialchars($customerName, ENT_QUOTES, 'UTF-8') ?></strong></div>
+            <div class="muted">RUT: <?= htmlspecialchars($customerRut, ENT_QUOTES, 'UTF-8') ?></div>
+            <div class="muted">Contacto: <?= htmlspecialchars($customerContact, ENT_QUOTES, 'UTF-8') ?></div>
+            <div class="muted">Email: <?= htmlspecialchars($customerEmail, ENT_QUOTES, 'UTF-8') ?></div>
+          </td>
+          <td>
+            <h3>Condiciones</h3>
+            <div class="muted">Validez: <?= htmlspecialchars($validez, ENT_QUOTES, 'UTF-8') ?></div>
+            <div class="muted">Entrega: <?= htmlspecialchars($entrega, ENT_QUOTES, 'UTF-8') ?></div>
+            <div class="muted">Condicion de pago: <?= htmlspecialchars($condicionPago, ENT_QUOTES, 'UTF-8') ?></div>
+            <div class="muted">Moneda: <?= htmlspecialchars($moneda, ENT_QUOTES, 'UTF-8') ?></div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <section>
+      <table class="items">
+        <thead>
+          <tr>
+            <th style="width:52%;">Descripcion</th>
+            <th style="width:12%;">Cantidad</th>
+            <th style="width:18%;">Precio unitario</th>
+            <th style="width:18%;">Total linea</th>
+          </tr>
+        </thead>
+        <tbody>
+          <?php if (empty($quoteItems)): ?>
+            <tr><td colspan="4">Sin items.</td></tr>
+          <?php else: ?>
+            <?php foreach ($quoteItems as $it): ?>
+              <?php
+                $itemType = strtolower(trim((string)($it['item_type'] ?? 'normal')));
+                if (!in_array($itemType, ['normal', 'text'], true)) {
+                  $itemType = 'normal';
+                }
+                $isBold = ((int)($it['is_bold'] ?? 0) === 1);
+                $desc = htmlspecialchars((string)($it['descripcion'] ?? ''), ENT_QUOTES, 'UTF-8');
+              ?>
+              <tr>
+                <td><?= $isBold ? '<strong>' . $desc . '</strong>' : $desc ?></td>
+                <td><?= $itemType === 'text' ? '-' : htmlspecialchars((string)($it['cantidad'] ?? ''), ENT_QUOTES, 'UTF-8') ?></td>
+                <td><?= $itemType === 'text' ? '-' : ('$' . htmlspecialchars(money_clp((float)($it['precio_unitario'] ?? 0)), ENT_QUOTES, 'UTF-8')) ?></td>
+                <td><?= $itemType === 'text' ? '-' : ('$' . htmlspecialchars(money_clp((float)($it['total_linea'] ?? 0)), ENT_QUOTES, 'UTF-8')) ?></td>
+              </tr>
+            <?php endforeach; ?>
+          <?php endif; ?>
+        </tbody>
+      </table>
+    </section>
+
+    <?php if (trim((string)($quoteRow['observaciones'] ?? '')) !== ''): ?>
+      <section class="obs">
+        <strong>Observaciones</strong>
+        <div><?= htmlspecialchars((string)$quoteRow['observaciones'], ENT_QUOTES, 'UTF-8') ?></div>
+      </section>
+    <?php endif; ?>
+    </div><!-- /.page-content -->
+
+    <table class="financials-table">
+      <tbody>
+        <tr>
+          <td class="col-terms">
+            <div class="quote-terms-box">
+              <h4 class="quote-terms-title">Terminos y condiciones adicionales</h4>
+              <div class="quote-terms-content"><?= htmlspecialchars(trim((string)($quoteRow['terminos_condiciones_adicionales'] ?? '')) !== '' ? (string)$quoteRow['terminos_condiciones_adicionales'] : 'Sin terminos adicionales.', ENT_QUOTES, 'UTF-8') ?></div>
+            </div>
+          </td>
+          <td class="col-totals">
+            <div class="totals-box">
+              <table class="totals">
+                <tbody>
+                  <tr><td>Subtotal</td><td style="text-align:right;">$<?= htmlspecialchars(money_clp((float)$money['subtotal']), ENT_QUOTES, 'UTF-8') ?></td></tr>
+                  <tr><td>Descuento (<?= htmlspecialchars(number_format((float)$money['descuento_pct'], 2, '.', ''), ENT_QUOTES, 'UTF-8') ?>%)</td><td style="text-align:right;">$<?= htmlspecialchars(money_clp((float)$money['descuento_monto']), ENT_QUOTES, 'UTF-8') ?></td></tr>
+                  <tr><td>IVA (19%)</td><td style="text-align:right;">$<?= htmlspecialchars(money_clp((float)$money['iva_monto']), ENT_QUOTES, 'UTF-8') ?></td></tr>
+                  <tr><td>Total</td><td style="text-align:right;">$<?= htmlspecialchars(money_clp((float)$money['total']), ENT_QUOTES, 'UTF-8') ?></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </article>
+</body>
+</html>
+<?php
+
+  return (string)ob_get_clean();
+}
+
+function build_quote_pdf_attachment($companyName, $previewUrl, array $quoteRow, array $quoteItems, array $profile = [], $logoPublicUrl = '')
 {
   $quoteNumber = (string)($quoteRow['numero_cotizacion'] ?? '');
-  $customerName = (string)($quoteRow['customer_name'] ?? '');
-  $dateIssued = (string)($quoteRow['fecha_emision'] ?? '');
-  $state = (string)($quoteRow['estado'] ?? '');
-  $total = number_format((float)($quoteRow['total'] ?? 0), 0, ',', '.');
-  $safeCompany = htmlspecialchars($companyName !== '' ? $companyName : 'GesMan HERMES', ENT_QUOTES, 'UTF-8');
-  $safeNumber = htmlspecialchars($quoteNumber, ENT_QUOTES, 'UTF-8');
-  $safeCustomer = htmlspecialchars($customerName, ENT_QUOTES, 'UTF-8');
-  $safeDate = htmlspecialchars($dateIssued, ENT_QUOTES, 'UTF-8');
-  $safeState = htmlspecialchars($state, ENT_QUOTES, 'UTF-8');
-  $safeTotal = htmlspecialchars($total, ENT_QUOTES, 'UTF-8');
-  $safeUrl = htmlspecialchars($previewUrl, ENT_QUOTES, 'UTF-8');
+  $attachmentName = sanitize_attachment_name('cotizacion-' . ($quoteNumber !== '' ? $quoteNumber : date('Ymd_His')) . '.pdf', 'cotizacion.pdf');
 
-  $rows = '';
-  foreach ($quoteItems as $it) {
-    $itemType = strtolower(trim((string)($it['item_type'] ?? 'normal')));
-    $isText = ($itemType === 'text');
-    $desc = htmlspecialchars((string)($it['descripcion'] ?? ''), ENT_QUOTES, 'UTF-8');
-    $qty = $isText ? '-' : htmlspecialchars((string)($it['cantidad'] ?? ''), ENT_QUOTES, 'UTF-8');
-    $price = $isText ? '-' : '$' . number_format((float)($it['precio_unitario'] ?? 0), 0, ',', '.');
-    $lineTotal = $isText ? '-' : '$' . number_format((float)($it['total_linea'] ?? 0), 0, ',', '.');
-    $rows .= '<tr>'
-      . '<td style="border:1px solid #d4d8e0;padding:7px;">' . $desc . '</td>'
-      . '<td style="border:1px solid #d4d8e0;padding:7px;text-align:center;">' . $qty . '</td>'
-      . '<td style="border:1px solid #d4d8e0;padding:7px;text-align:right;">' . htmlspecialchars($price, ENT_QUOTES, 'UTF-8') . '</td>'
-      . '<td style="border:1px solid #d4d8e0;padding:7px;text-align:right;">' . htmlspecialchars($lineTotal, ENT_QUOTES, 'UTF-8') . '</td>'
-      . '</tr>';
+  // Intento principal: generar PDF estilizado local sin auto-llamadas HTTP para evitar bloqueos/timeout.
+  $styledError = '';
+  try {
+    $html = build_quote_preview_html_for_attachment($profile, $logoPublicUrl, $quoteRow, $quoteItems);
+    if (trim($html) !== '') {
+      $tmpHtmlBase = @tempnam(sys_get_temp_dir(), 'quote_html_');
+      $tmpPdfBase = @tempnam(sys_get_temp_dir(), 'quote_pdf_');
+      if (is_string($tmpHtmlBase) && $tmpHtmlBase !== '' && is_string($tmpPdfBase) && $tmpPdfBase !== '') {
+        $tmpHtmlPath = $tmpHtmlBase . '.html';
+        $tmpPdfPath = $tmpPdfBase . '.pdf';
+        @unlink($tmpHtmlBase);
+        @unlink($tmpPdfBase);
+        @file_put_contents($tmpHtmlPath, $html);
+
+        $wkhtmlCandidates = ['/usr/bin/wkhtmltopdf', '/usr/local/bin/wkhtmltopdf', 'wkhtmltopdf'];
+        foreach ($wkhtmlCandidates as $wkhtmlBin) {
+          $commandPrefix = '';
+          if (PHP_OS_FAMILY !== 'Windows' && is_executable('/usr/bin/timeout')) {
+            $commandPrefix = escapeshellarg('/usr/bin/timeout') . ' 12s ';
+          }
+
+          $cmd = $commandPrefix
+            . escapeshellarg($wkhtmlBin)
+            . ' --quiet --encoding UTF-8 --page-size Letter --background'
+            . ' --margin-top 14mm --margin-right 12mm --margin-bottom 14mm --margin-left 12mm'
+            . ' --load-error-handling ignore --load-media-error-handling ignore'
+            . ' --disable-javascript --disable-smart-shrinking'
+            . ' --enable-local-file-access'
+            . ' ' . escapeshellarg($tmpHtmlPath)
+            . ' ' . escapeshellarg($tmpPdfPath)
+            . ' 2>&1';
+
+          $out = [];
+          $code = 1;
+          @exec($cmd, $out, $code);
+
+          if ($code === 0 && is_file($tmpPdfPath)) {
+            $pdfStyled = @file_get_contents($tmpPdfPath);
+            if (is_string($pdfStyled) && strlen($pdfStyled) > 20 && strncmp($pdfStyled, '%PDF', 4) === 0) {
+              @unlink($tmpHtmlPath);
+              @unlink($tmpPdfPath);
+              return [
+                'name' => $attachmentName,
+                'mime' => 'application/pdf',
+                'content' => $pdfStyled,
+              ];
+            }
+          }
+
+          $styledError = 'wkhtmltopdf exit=' . (string)$code . ' output=' . implode(' | ', array_slice($out, -5));
+        }
+
+        @unlink($tmpHtmlPath);
+        @unlink($tmpPdfPath);
+      }
+    }
+  } catch (Throwable $pdfError) {
+    $styledError = $pdfError->getMessage();
   }
-  if ($rows === '') {
-    $rows = '<tr><td colspan="4" style="border:1px solid #d4d8e0;padding:8px;">Sin items</td></tr>';
-  }
-
-  $html = '<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Cotizacion ' . $safeNumber . '</title></head><body style="font-family:Segoe UI,Arial,sans-serif;color:#0f172a;">'
-    . '<h2 style="margin:0 0 8px;">' . $safeCompany . ' - Cotizacion ' . $safeNumber . '</h2>'
-    . '<p style="margin:0 0 12px;">Cliente: <strong>' . $safeCustomer . '</strong> | Fecha: ' . $safeDate . ' | Estado: ' . $safeState . '</p>'
-    . '<table style="border-collapse:collapse;width:100%;font-size:13px;">'
-    . '<thead><tr>'
-    . '<th style="border:1px solid #d4d8e0;padding:7px;background:#eef3ff;text-align:left;">Descripcion</th>'
-    . '<th style="border:1px solid #d4d8e0;padding:7px;background:#eef3ff;text-align:center;">Cantidad</th>'
-    . '<th style="border:1px solid #d4d8e0;padding:7px;background:#eef3ff;text-align:right;">Precio</th>'
-    . '<th style="border:1px solid #d4d8e0;padding:7px;background:#eef3ff;text-align:right;">Total</th>'
-    . '</tr></thead><tbody>' . $rows . '</tbody></table>'
-    . '<p style="margin:12px 0 0;">Total: <strong>$' . $safeTotal . '</strong></p>'
-    . '<p style="margin:10px 0 0;">Vista imprimible: <a href="' . $safeUrl . '">' . $safeUrl . '</a></p>'
-    . '</body></html>';
-
-  return [
-    'name' => sanitize_attachment_name('cotizacion-' . ($quoteNumber !== '' ? $quoteNumber : date('Ymd_His')) . '.html', 'cotizacion.html'),
-    'mime' => 'text/html; charset=UTF-8',
-    'content' => $html,
-  ];
+  throw new RuntimeException('No fue posible generar el PDF estilizado de cotizacion. ' . $styledError);
 }
 
 function send_quote_email_smtp($mailCfg, array $toList, array $ccList, $subject, $textMessage, $htmlMessage, array $attachments)
@@ -608,6 +909,49 @@ function logo_public_url($relativePath)
     return '/uploads/' . implode('/', $parts);
 }
 
+  function logo_data_uri($relativePath)
+  {
+    $rel = trim((string)$relativePath);
+    if ($rel === '') {
+      return '';
+    }
+
+    $rel = preg_replace('#/+#', '/', str_replace('\\', '/', $rel));
+    $rel = ltrim((string)$rel, '/');
+    if (str_starts_with($rel, 'uploads/')) {
+      $rel = substr($rel, 8);
+    }
+    if ($rel === '') {
+      return '';
+    }
+
+    $root = rtrim(str_replace('\\', '/', uploads_root_dir(false)), '/');
+    $abs = $root . '/' . ltrim($rel, '/');
+    if (!str_starts_with($abs, $root . '/')) {
+      return '';
+    }
+    if (!is_file($abs)) {
+      return '';
+    }
+
+    $bin = @file_get_contents($abs);
+    if ($bin === false || $bin === '') {
+      return '';
+    }
+
+    $mime = 'image/png';
+    try {
+      $finfo = new finfo(FILEINFO_MIME_TYPE);
+      $detected = (string)$finfo->file($abs);
+      if ($detected !== '') {
+        $mime = $detected;
+      }
+    } catch (Throwable $e) {
+    }
+
+    return 'data:' . $mime . ';base64,' . base64_encode($bin);
+  }
+
   function dashboard_module_url($module)
   {
     $safe = in_array($module, ['dashboard', 'plan', 'empresa', 'clientes', 'cotizaciones', 'papelera', 'configuracion'], true) ? $module : 'dashboard';
@@ -630,7 +974,7 @@ function logo_public_url($relativePath)
 
   function plan_display_name($planCode)
   {
-    $code = strtolower(trim((string)$planCode));
+    $code = normalize_plan_code((string)$planCode, 'basico');
     if ($code === 'pro') {
       return 'Heroe';
     }
@@ -643,10 +987,28 @@ function logo_public_url($relativePath)
     return 'Mortal';
   }
 
-  function plan_storage_limit_mb($planCode)
+  function normalize_plan_code($planCode, $fallback = 'basico')
   {
     $code = strtolower(trim((string)$planCode));
+    if (in_array($code, ['heroe', 'pro'], true)) {
+      return 'pro';
+    }
+    if (in_array($code, ['semidios', 'semi_dios', 'enterprise'], true)) {
+      return 'enterprise';
+    }
+    if (in_array($code, ['olimpico'], true)) {
+      return 'olimpico';
+    }
     if (in_array($code, ['mortal', 'basic', 'basico'], true)) {
+      return 'basico';
+    }
+    return (string)$fallback;
+  }
+
+  function plan_storage_limit_mb($planCode)
+  {
+    $code = normalize_plan_code((string)$planCode, 'basico');
+    if ($code === 'basico') {
       return 100;
     }
     return 1024;
@@ -848,7 +1210,7 @@ $quoteEmailForm = [
   'to' => '',
   'cc' => '',
   'subject' => '',
-  'message' => "Hola,\n\nTe compartimos la cotizacion solicitada.\n\nQuedo atento a tus comentarios.",
+  'message' => "Te compartimos la cotizacion solicitada.\n\nQuedo atento a tus comentarios.",
   'include_quote_attachment' => '1',
 ];
 
@@ -1951,8 +2313,14 @@ try {
             $flash['error'] = 'Debes seleccionar una cotizacion valida para enviar.';
           } else {
             $stQuote = $pdo->prepare(
-              'SELECT q.id, q.customer_id, q.numero_cotizacion, q.fecha_emision, q.total, q.estado,
+                  'SELECT q.id, q.customer_id, q.numero_cotizacion, q.fecha_emision, q.validez_dias,
+                    q.descuento_pct, q.subtotal, q.total, q.estado, q.terminos_condiciones_adicionales,
+                    q.validez_override, q.entrega_override, q.condicion_de_pago_override, q.moneda_override,
+                    q.observaciones,
                       c.razon_social AS customer_name,
+                    c.rut AS customer_rut,
+                      c.contacto AS customer_contact,
+                      c.contact_name AS customer_contact_name,
                       c.email AS customer_email
                FROM tenant_quotes q
                INNER JOIN tenant_customers c
@@ -1969,12 +2337,42 @@ try {
             if (!$quoteRow) {
               $flash['error'] = 'La cotizacion seleccionada no pertenece a tu empresa.';
             } else {
+              $companyProfileEmail = '';
+              $stCompanyMail = $pdo->prepare(
+                'SELECT email_principal
+                 FROM tenant_company_profiles
+                 WHERE tenant_company_id = :tenant_company_id
+                 LIMIT 1'
+              );
+              $stCompanyMail->execute(['tenant_company_id' => $tenantCompanyId]);
+              $companyMailRow = $stCompanyMail->fetch();
+              if ($companyMailRow) {
+                $companyProfileEmail = trim((string)($companyMailRow['email_principal'] ?? ''));
+              }
+
               if ($quoteEmailForm['to'] === '' && !empty($quoteRow['customer_email'])) {
                 $quoteEmailForm['to'] = trim((string)$quoteRow['customer_email']);
               }
 
               $toList = parse_email_list($quoteEmailForm['to'], 10);
               $ccList = parse_email_list($quoteEmailForm['cc'], 10);
+
+              $companyReviewRecipients = parse_email_list([
+                (string)($accountSettings['email'] ?? ''),
+                (string)($companyEmail ?? ''),
+                (string)$companyProfileEmail,
+                (string)$accountLoginEmail,
+              ], 10);
+              foreach ($companyReviewRecipients as $reviewEmail) {
+                if (!in_array($reviewEmail, $toList, true) && !in_array($reviewEmail, $ccList, true)) {
+                  $ccList[] = $reviewEmail;
+                }
+              }
+
+              if (count($ccList) > 10) {
+                $ccList = array_slice($ccList, 0, 10);
+              }
+
               if (empty($toList)) {
                 $flash['error'] = 'Ingresa al menos un correo valido en el campo Para.';
               } else {
@@ -1984,13 +2382,21 @@ try {
                 } else {
                   $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
                   $host = (string)($_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost');
-                  $previewUrl = $scheme . '://' . $host . '/dashboard/?module=cotizaciones&view_quote_id=' . (int)$quoteRow['id'];
+                  $previewUrl = $scheme . '://' . $host . '/empresa/dashboard/?module=cotizaciones&view_quote_id=' . (int)$quoteRow['id'] . '&quote_embed=1';
 
                   if ($quoteEmailForm['subject'] === '') {
                     $quoteEmailForm['subject'] = 'Cotizacion ' . (string)$quoteRow['numero_cotizacion'] . ' - ' . $companyName;
                   }
+                  $customerContact = trim((string)($quoteRow['customer_contact'] ?? ''));
+                  if ($customerContact === '') {
+                    $customerContact = trim((string)($quoteRow['customer_contact_name'] ?? ''));
+                  }
+                  if ($customerContact === '') {
+                    $customerContact = trim((string)($quoteRow['customer_name'] ?? ''));
+                  }
+
                   if ($quoteEmailForm['message'] === '') {
-                    $quoteEmailForm['message'] = "Hola,\n\nTe compartimos la cotizacion " . (string)$quoteRow['numero_cotizacion'] . ".\n\nQuedo atento a tus comentarios.";
+                    $quoteEmailForm['message'] = "Te compartimos la cotizacion " . (string)$quoteRow['numero_cotizacion'] . ".\n\nQuedo atento a tus comentarios.";
                   }
 
                   $attachments = [];
@@ -1998,6 +2404,43 @@ try {
                   $maxUploadBytes = 25 * 1024 * 1024;
 
                   if ($quoteEmailForm['include_quote_attachment'] === '1') {
+                    $profileForPdf = [
+                      'nombre' => '',
+                      'rut' => '',
+                      'direccion' => '',
+                      'telefono' => '',
+                      'email_principal' => '',
+                      'condicion_de_pago' => '',
+                      'entrega' => '',
+                      'validez' => '',
+                      'moneda' => 'CLP',
+                    ];
+                    $logoPublicUrlForPdf = '';
+
+                    $stProfileForPdf = $pdo->prepare(
+                      'SELECT nombre, rut, direccion, telefono, email_principal, condicion_de_pago, entrega, validez, moneda, logo_filename
+                       FROM tenant_company_profiles
+                       WHERE tenant_company_id = :tenant_company_id
+                       LIMIT 1'
+                    );
+                    $stProfileForPdf->execute(['tenant_company_id' => $tenantCompanyId]);
+                    $profileRowForPdf = $stProfileForPdf->fetch();
+                    if ($profileRowForPdf) {
+                      $logoRelativePathForPdf = (string)($profileRowForPdf['logo_filename'] ?? '');
+                      foreach ($profileForPdf as $k => $v) {
+                        if (array_key_exists($k, $profileRowForPdf)) {
+                          $profileForPdf[$k] = (string)$profileRowForPdf[$k];
+                        }
+                      }
+                      $logoPublicUrlForPdf = logo_data_uri($logoRelativePathForPdf);
+                      if ($logoPublicUrlForPdf === '') {
+                        $logoPublicUrlForPdf = logo_public_url($logoRelativePathForPdf);
+                        if ($logoPublicUrlForPdf !== '' && strpos($logoPublicUrlForPdf, 'http://') !== 0 && strpos($logoPublicUrlForPdf, 'https://') !== 0) {
+                          $logoPublicUrlForPdf = $scheme . '://' . $host . '/' . ltrim($logoPublicUrlForPdf, '/');
+                        }
+                      }
+                    }
+
                     $stQuoteItems = $pdo->prepare(
                       'SELECT descripcion, item_type, is_bold, cantidad, precio_unitario, total_linea
                        FROM tenant_quote_items
@@ -2006,7 +2449,12 @@ try {
                     );
                     $stQuoteItems->execute(['tenant_quote_id' => $quoteId]);
                     $quoteItemsForMail = $stQuoteItems->fetchAll();
-                    $attachments[] = build_quote_html_attachment((string)$companyName, $previewUrl, $quoteRow, $quoteItemsForMail);
+                    try {
+                      $attachments[] = build_quote_pdf_attachment((string)$companyName, $previewUrl, $quoteRow, $quoteItemsForMail, $profileForPdf, $logoPublicUrlForPdf);
+                    } catch (Throwable $pdfBuildError) {
+                      $flash['error'] = 'No fue posible generar el PDF de la cotizacion con formato. Intenta nuevamente en unos segundos.';
+                      error_log('HERMES_QUOTE_PDF_BUILD_ERROR: ' . $pdfBuildError->getMessage());
+                    }
                   }
 
                   if (isset($_FILES['quote_email_files']) && is_array($_FILES['quote_email_files'])) {
@@ -2075,17 +2523,23 @@ try {
                     $safeQuoteNumber = htmlspecialchars((string)$quoteRow['numero_cotizacion'], ENT_QUOTES, 'UTF-8');
                     $safeCustomerName = htmlspecialchars((string)($quoteRow['customer_name'] ?? ''), ENT_QUOTES, 'UTF-8');
                     $safeCompanyName = htmlspecialchars((string)($companyName !== '' ? $companyName : 'GesMan HERMES'), ENT_QUOTES, 'UTF-8');
+                    $safeCustomerContact = htmlspecialchars($customerContact !== '' ? $customerContact : 'cliente', ENT_QUOTES, 'UTF-8');
+                    $greetingText = 'Hola ' . ($customerContact !== '' ? $customerContact : 'cliente') . ',';
+                    $messageStartsWithHola = (bool)preg_match('/^\s*hola\b/i', (string)$quoteEmailForm['message']);
 
-                    $htmlBody = '<p>' . $safeMessageHtml . '</p>'
+                    $htmlBody = '';
+                    if (!$messageStartsWithHola) {
+                      $htmlBody .= '<p>Hola ' . $safeCustomerContact . ',</p>';
+                    }
+
+                    $htmlBody .= '<p>' . $safeMessageHtml . '</p>'
                       . '<p><strong>Cotizacion:</strong> ' . $safeQuoteNumber . '<br>'
                       . '<strong>Cliente:</strong> ' . $safeCustomerName . '</p>'
-                      . '<p>Puedes revisar la vista imprimible aqui: <a href="' . $safePreviewUrl . '">' . $safePreviewUrl . '</a></p>'
                       . '<p>Saludos,<br>' . $safeCompanyName . '</p>';
 
-                    $textBody = $quoteEmailForm['message']
+                    $textBody = ($messageStartsWithHola ? $quoteEmailForm['message'] : ($greetingText . "\n\n" . $quoteEmailForm['message']))
                       . "\n\nCotizacion: " . (string)$quoteRow['numero_cotizacion']
-                      . "\nCliente: " . (string)($quoteRow['customer_name'] ?? '')
-                      . "\nVista imprimible: " . $previewUrl;
+                      . "\nCliente: " . (string)($quoteRow['customer_name'] ?? '');
 
                     $sent = send_quote_email_smtp(
                       $mailCfg,
@@ -2119,7 +2573,7 @@ try {
                         'to' => '',
                         'cc' => '',
                         'subject' => '',
-                        'message' => "Hola,\n\nTe compartimos la cotizacion solicitada.\n\nQuedo atento a tus comentarios.",
+                        'message' => "Te compartimos la cotizacion solicitada.\n\nQuedo atento a tus comentarios.",
                         'include_quote_attachment' => '1',
                       ];
                     } else {
@@ -2527,6 +2981,9 @@ try {
 
     $logoPublicUrl = logo_public_url($profile['logo_filename']);
 
+    $effectivePlanCode = normalize_plan_code((string)$usage['plan_code'], 'basico');
+    $seedStorageLimitMb = plan_storage_limit_mb($effectivePlanCode);
+
     $seedUsage = $pdo->prepare(
         'INSERT INTO tenant_plan_usage (tenant_company_id, plan_code, storage_limit_mb, storage_used_mb)
          VALUES (:tenant_company_id, :plan_code, :storage_limit_mb, :storage_used_mb)
@@ -2534,8 +2991,8 @@ try {
     );
     $seedUsage->execute([
         'tenant_company_id' => $tenantCompanyId,
-        'plan_code' => 'basico',
-      'storage_limit_mb' => 100,
+        'plan_code' => $effectivePlanCode,
+      'storage_limit_mb' => $seedStorageLimitMb,
         'storage_used_mb' => 0,
     ]);
 
@@ -2543,11 +3000,26 @@ try {
     $stUsage->execute(['tenant_company_id' => $tenantCompanyId]);
     $usageRow = $stUsage->fetch();
     if ($usageRow) {
-        $usage['plan_code'] = (string)$usageRow['plan_code'];
+        $usagePlanCode = normalize_plan_code((string)$usageRow['plan_code'], $effectivePlanCode);
+        if ($usagePlanCode !== $effectivePlanCode) {
+          $usagePlanCode = $effectivePlanCode;
+          $upUsagePlan = $pdo->prepare(
+            'UPDATE tenant_plan_usage
+             SET plan_code = :plan_code
+             WHERE tenant_company_id = :tenant_company_id
+             LIMIT 1'
+          );
+          $upUsagePlan->execute([
+            'plan_code' => $usagePlanCode,
+            'tenant_company_id' => $tenantCompanyId,
+          ]);
+        }
+
+        $usage['plan_code'] = $usagePlanCode;
       $usage['storage_limit_mb'] = max(1, (int)$usageRow['storage_limit_mb']);
         $usage['storage_used_mb'] = max(0, (int)$usageRow['storage_used_mb']);
       $expectedLimitMb = plan_storage_limit_mb($usage['plan_code']);
-      if (in_array(strtolower(trim((string)$usage['plan_code'])), ['mortal', 'basic', 'basico'], true) && $usage['storage_limit_mb'] !== $expectedLimitMb) {
+      if ($usage['storage_limit_mb'] !== $expectedLimitMb) {
         $usage['storage_limit_mb'] = $expectedLimitMb;
         $upUsageLimit = $pdo->prepare('UPDATE tenant_plan_usage SET storage_limit_mb = :storage_limit_mb WHERE tenant_company_id = :tenant_company_id LIMIT 1');
         $upUsageLimit->execute([
@@ -4311,6 +4783,41 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       backdrop-filter: blur(2px);
     }
     .modal-backdrop.open { display: flex; }
+    .sending-modal-card {
+      width: min(420px, 100%);
+      border: 1px solid #33528f;
+      border-radius: 14px;
+      background: linear-gradient(180deg, #0f1f41, #0a1732);
+      box-shadow: 0 26px 60px rgba(2,8,23,.55);
+      padding: 1rem 1.1rem;
+      text-align: center;
+      color: #e2e8f0;
+    }
+    .sending-modal-spinner {
+      width: 42px;
+      height: 42px;
+      border-radius: 999px;
+      margin: 0 auto .85rem;
+      border: 3px solid rgba(244,180,0,.24);
+      border-top-color: #f4b400;
+      animation: sendingSpin .8s linear infinite;
+    }
+    .sending-modal-title {
+      margin: 0;
+      color: #fff4b8;
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: .02em;
+    }
+    .sending-modal-text {
+      margin: .42rem 0 0;
+      color: #c8d7ef;
+      font-size: .86rem;
+      line-height: 1.35;
+    }
+    @keyframes sendingSpin {
+      to { transform: rotate(360deg); }
+    }
     .modal-card {
       width: min(980px, 100%);
       max-height: calc(100vh - 2rem);
@@ -5774,6 +6281,7 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
                             data-quote-id="<?= h((string)$quote['id']) ?>"
                             data-quote-number="<?= h((string)$quote['numero_cotizacion']) ?>"
                             data-customer-name="<?= h((string)$quote['customer_name']) ?>"
+                            data-customer-contact="<?= h((string)($quote['customer_contact'] ?? '')) ?>"
                             data-customer-email="<?= h((string)($quote['customer_email'] ?? '')) ?>"
                             data-print-url="/empresa/dashboard/?module=cotizaciones&amp;view_quote_id=<?= h((string)$quote['id']) ?>"
                           >
@@ -6005,16 +6513,24 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
 
                 <label class="quote-email-check">
                   <input type="checkbox" name="include_quote_attachment" value="1" <?= ((string)($quoteEmailForm['include_quote_attachment'] ?? '1') === '1') ? 'checked' : '' ?> data-quote-email-include="1">
-                  Adjuntar resumen de la cotizacion en archivo HTML
+                  Adjuntar cotizacion en PDF
                 </label>
                 <p class="quote-email-note" data-quote-email-meta="1">Se incluira tambien el enlace a la vista imprimible de la cotizacion.</p>
 
                 <div class="modal-actions">
                   <button class="btn" type="button" data-close-quote-email="1">Cancelar</button>
-                  <button class="btn primary" type="submit">Enviar correo</button>
+                  <button class="btn primary" type="submit" data-quote-email-submit-label="1">Enviar correo</button>
                 </div>
               </form>
             </div>
+          </div>
+        </div>
+
+        <div class="modal-backdrop" id="quoteEmailSendingModal" aria-hidden="true">
+          <div class="sending-modal-card" role="status" aria-live="polite" aria-label="Enviando correo de cotizacion">
+            <div class="sending-modal-spinner" aria-hidden="true"></div>
+            <p class="sending-modal-title">Enviando correo...</p>
+            <p class="sending-modal-text">Por favor espera. Estamos generando el PDF y enviando la cotizacion.</p>
           </div>
         </div>
 
@@ -7102,11 +7618,31 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
         var triggerButtons = document.querySelectorAll('[data-open-quote-email="1"]');
         var closeButtons = emailModal.querySelectorAll('[data-close-quote-email="1"]');
         var idInput = emailModal.querySelector('[data-quote-email-id="1"]');
+        var emailForm = emailModal.querySelector('#quoteEmailForm');
         var toInput = emailModal.querySelector('[data-quote-email-to="1"]');
         var subjectInput = emailModal.querySelector('[data-quote-email-subject="1"]');
         var messageInput = emailModal.querySelector('[data-quote-email-message="1"]');
         var metaLabel = emailModal.querySelector('[data-quote-email-meta="1"]');
+        var submitLabel = emailModal.querySelector('[data-quote-email-submit-label="1"]');
+        var sendingModal = document.getElementById('quoteEmailSendingModal');
+        var isSending = false;
         var defaultMessage = messageInput ? messageInput.value : '';
+
+        function openSendingModal() {
+          if (!sendingModal) {
+            return;
+          }
+          sendingModal.classList.add('open');
+          sendingModal.setAttribute('aria-hidden', 'false');
+        }
+
+        function closeSendingModal() {
+          if (!sendingModal) {
+            return;
+          }
+          sendingModal.classList.remove('open');
+          sendingModal.setAttribute('aria-hidden', 'true');
+        }
 
         function openModal() {
           emailModal.classList.add('open');
@@ -7119,6 +7655,19 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
         function closeModal() {
           emailModal.classList.remove('open');
           emailModal.setAttribute('aria-hidden', 'true');
+        }
+
+        function onFormSubmit(event) {
+          if (isSending) {
+            event.preventDefault();
+            return;
+          }
+          isSending = true;
+          if (submitLabel) {
+            submitLabel.disabled = true;
+            submitLabel.textContent = 'Enviando...';
+          }
+          openSendingModal();
         }
 
         function onBackdropClick(event) {
@@ -7138,6 +7687,7 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
           var quoteId = button.getAttribute('data-quote-id') || '';
           var quoteNumber = button.getAttribute('data-quote-number') || '';
           var customerName = button.getAttribute('data-customer-name') || '';
+          var customerContact = button.getAttribute('data-customer-contact') || '';
           var customerEmail = button.getAttribute('data-customer-email') || '';
           var printUrl = button.getAttribute('data-print-url') || '';
 
@@ -7151,7 +7701,8 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             subjectInput.value = quoteNumber ? ('Cotizacion ' + quoteNumber + ' - GesMan HERMES') : 'Cotizacion GesMan HERMES';
           }
           if (messageInput) {
-            var hello = customerName ? ('Hola ' + customerName + ',') : 'Hola,';
+            var recipientName = customerContact || customerName;
+            var hello = recipientName ? ('Hola ' + recipientName + ',') : 'Hola,';
             messageInput.value = hello + '\n\nTe compartimos la cotizacion ' + quoteNumber + '.\n\nQuedo atento a tus comentarios.';
           }
           if (metaLabel) {
@@ -7172,6 +7723,9 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
 
         emailModal.addEventListener('click', onBackdropClick);
         document.addEventListener('keydown', onEsc);
+        if (emailForm) {
+          emailForm.addEventListener('submit', onFormSubmit);
+        }
 
         quoteEmailCleanup = function () {
           triggerButtons.forEach(function (button) {
@@ -7182,6 +7736,15 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
           });
           emailModal.removeEventListener('click', onBackdropClick);
           document.removeEventListener('keydown', onEsc);
+          if (emailForm) {
+            emailForm.removeEventListener('submit', onFormSubmit);
+          }
+          isSending = false;
+          closeSendingModal();
+          if (submitLabel) {
+            submitLabel.disabled = false;
+            submitLabel.textContent = 'Enviar correo';
+          }
           if (messageInput && messageInput.value === '') {
             messageInput.value = defaultMessage;
           }
