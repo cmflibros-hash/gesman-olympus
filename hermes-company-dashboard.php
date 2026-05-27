@@ -5338,6 +5338,46 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
       padding: .75rem;
       display: grid;
       gap: .45rem;
+      position: relative;
+      overflow: hidden;
+    }
+    .plan-upgrade-item.current {
+      border-color: rgba(244,180,0,.95);
+      box-shadow:
+        0 0 0 1px rgba(255,227,139,.45),
+        0 12px 28px rgba(244,180,0,.18);
+      background:
+        linear-gradient(180deg, rgba(244,180,0,.18), rgba(244,180,0,.06)),
+        linear-gradient(180deg, #102046, #0b1734);
+    }
+    .plan-upgrade-item.current::after {
+      content: '';
+      position: absolute;
+      top: -28%;
+      left: -42%;
+      width: 180%;
+      height: 58%;
+      transform: rotate(-6deg);
+      background: linear-gradient(120deg, rgba(255,227,139,0), rgba(255,227,139,.38), rgba(244,180,0,0));
+      pointer-events: none;
+    }
+    .plan-current-badge {
+      justify-self: start;
+      display: inline-flex;
+      align-items: center;
+      gap: .2rem;
+      margin-top: -.08rem;
+      padding: .18rem .56rem;
+      border-radius: 999px;
+      border: 1px solid rgba(244,180,0,.92);
+      background: linear-gradient(180deg, #ffe38b, #f4b400);
+      color: #1f2937;
+      font-size: .72rem;
+      font-weight: 800;
+      letter-spacing: .02em;
+      text-transform: uppercase;
+      position: relative;
+      z-index: 1;
     }
     .plan-upgrade-item h4 {
       margin: 0;
@@ -5730,6 +5770,9 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
               'enterprise' => 3,
             ];
             $currentPlanRankUi = (int)($planRankUi[$currentPlanCodeUi] ?? 1);
+            $isCurrentBasicoUi = ($currentPlanCodeUi === 'basico');
+            $isCurrentProUi = ($currentPlanCodeUi === 'pro');
+            $isCurrentEnterpriseUi = ($currentPlanCodeUi === 'enterprise');
             $planToneUi = $isPlanPaidUi ? 'ok' : 'warn';
             $planTitleUi = $isPlanPaidUi ? 'Plan pagado' : 'Pago pendiente';
             if ($planBilling['days_left'] === null) {
@@ -5797,8 +5840,9 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
           </div>
 
           <div class="plan-upgrade-grid" aria-label="Cambiar o pagar plan">
-            <article class="plan-upgrade-item">
+            <article class="plan-upgrade-item<?= $isCurrentBasicoUi ? ' current' : '' ?>">
               <h4>Plan Mortal</h4>
+              <?php if ($isCurrentBasicoUi): ?><span class="plan-current-badge">Plan actual</span><?php endif; ?>
               <p>Pago del plan base para mantener operacion y renovacion al dia.</p>
               <?php if ($currentPlanRankUi > 1): ?>
                 <span class="plan-pay-link disabled">Plan inferior al actual</span>
@@ -5811,8 +5855,9 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
               <?php endif; ?>
             </article>
 
-            <article class="plan-upgrade-item">
+            <article class="plan-upgrade-item<?= $isCurrentProUi ? ' current' : '' ?>">
               <h4>Plan Heroe</h4>
+              <?php if ($isCurrentProUi): ?><span class="plan-current-badge">Plan actual</span><?php endif; ?>
               <p>Escala capacidades operativas con funciones extendidas y usuarios tecnicos.</p>
               <?php if ($currentPlanRankUi > 2): ?>
                 <span class="plan-pay-link disabled">Plan inferior al actual</span>
@@ -5825,8 +5870,9 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
               <?php endif; ?>
             </article>
 
-            <article class="plan-upgrade-item">
+            <article class="plan-upgrade-item<?= $isCurrentEnterpriseUi ? ' current' : '' ?>">
               <h4>Plan Semidios</h4>
+              <?php if ($isCurrentEnterpriseUi): ?><span class="plan-current-badge">Plan actual</span><?php endif; ?>
               <p>Mayor capacidad para equipos tecnicos y reporteria avanzada interna/cliente.</p>
               <?php if ($isPlanUpToDateUi && $currentPlanCodeUi === 'enterprise'): ?>
                 <span class="plan-pay-link disabled">Cliente al dia</span>
