@@ -5547,12 +5547,6 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             <svg viewBox="0 0 16 16"><path d="M4 2.5h6l2 2V13.5H4zM10 2.5V5h2M6 7h4M6 9.5h4M6 12h3"/></svg>
           </span>
         </a>
-        <a class="<?= $module === 'plan' ? 'active' : '' ?>" href="/empresa/dashboard/?module=plan">
-          <span>Plan</span>
-          <span class="nav-icon" aria-hidden="true">
-            <svg viewBox="0 0 16 16"><path d="M2.5 3.5h11v9h-11zM5 6.2h6M5 8.5h6M5 10.8h3.6"/></svg>
-          </span>
-        </a>
         <?php if ($canAccessHeroeModules): ?>
           <a class="<?= $module === 'inventario' ? 'active' : '' ?>" href="/empresa/dashboard/?module=inventario">
             <span>Inventario</span>
@@ -5585,6 +5579,12 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
             </span>
           </a>
         <?php endif; ?>
+        <a class="<?= $module === 'plan' ? 'active' : '' ?>" href="/empresa/dashboard/?module=plan">
+          <span>Plan</span>
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16"><path d="M2.5 3.5h11v9h-11zM5 6.2h6M5 8.5h6M5 10.8h3.6"/></svg>
+          </span>
+        </a>
       </nav>
       <div class="side-toggle-wrap">
         <button class="side-toggle" type="button" data-side-toggle="1" aria-label="Contraer menu" aria-expanded="true" title="Contraer menu">
