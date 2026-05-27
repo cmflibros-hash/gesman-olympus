@@ -1559,6 +1559,9 @@ try {
             $tenantCompanyId = (int)$row['id'];
             $planBilling['plan_status'] = strtolower(trim((string)($row['plan_status'] ?? 'pending_payment')));
             $planBilling['is_enabled'] = (int)($row['is_enabled'] ?? 0);
+            if ($planBilling['plan_status'] === 'paid') {
+              $planBilling['payment_status'] = 'paid';
+            }
             $tenantBillingCycle = strtolower(trim((string)($row['billing_cycle'] ?? 'monthly')));
             if (!in_array($tenantBillingCycle, ['monthly', 'annual'], true)) {
               $tenantBillingCycle = 'monthly';
@@ -1579,6 +1582,9 @@ try {
             $tenantCompanyId = (int)$row['id'];
             $planBilling['plan_status'] = strtolower(trim((string)($row['plan_status'] ?? 'pending_payment')));
             $planBilling['is_enabled'] = (int)($row['is_enabled'] ?? 0);
+            if ($planBilling['plan_status'] === 'paid') {
+              $planBilling['payment_status'] = 'paid';
+            }
             $tenantBillingCycle = strtolower(trim((string)($row['billing_cycle'] ?? 'monthly')));
             if (!in_array($tenantBillingCycle, ['monthly', 'annual'], true)) {
               $tenantBillingCycle = 'monthly';
@@ -3033,7 +3039,7 @@ try {
         $usage['percent'] = (int)round(($usage['storage_used_mb'] / $usage['storage_limit_mb']) * 100);
     }
 
-    $isPaidAccount = ($planBilling['payment_status'] === 'paid') && ($planBilling['plan_status'] === 'paid');
+    $isPaidAccount = ($planBilling['payment_status'] === 'paid') || ($planBilling['plan_status'] === 'paid');
     if ($isPaidAccount) {
       $planBilling['can_pay_renewal'] = false;
       $currentPlanName = plan_display_name($usage['plan_code']);
@@ -5709,7 +5715,7 @@ if ($module === 'cotizaciones' && is_array($quotePreview) && !empty($quotePrevie
         <section class="panel compact">
           <?php
             $currentPlanNameUi = plan_display_name($usage['plan_code']);
-            $isPlanPaidUi = ($planBilling['payment_status'] === 'paid') && ($planBilling['plan_status'] === 'paid');
+            $isPlanPaidUi = ($planBilling['payment_status'] === 'paid') || ($planBilling['plan_status'] === 'paid');
             $currentPlanCodeUi = strtolower(trim((string)$usage['plan_code']));
             if (in_array($currentPlanCodeUi, ['mortal', 'basic', 'basico'], true)) {
               $currentPlanCodeUi = 'basico';

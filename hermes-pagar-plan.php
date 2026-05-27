@@ -334,6 +334,7 @@ if ($view['error'] === '') {
                 $view['error'] = 'Tu correo aun no esta verificado. Verifica el correo antes de pagar.';
             } else {
                 $signupPlanCode = normalize_plan_code((string)$signup['plan_code'], 'basico');
+                $effectivePaymentStatus = strtolower(trim((string)($signup['payment_status'] ?? 'unpaid')));
                 $planCode = $requestedTargetPlan;
                 $billingCycle = strtolower(trim((string)($signup['billing_cycle'] ?? 'monthly')));
                 if (!in_array($billingCycle, ['monthly', 'annual'], true)) {
@@ -343,7 +344,7 @@ if ($view['error'] === '') {
                 // Si el plan fue ajustado desde admin master, tenant_companies es la fuente efectiva.
                 if (table_exists($pdo, 'tenant_companies')) {
                     $stTenantPlan = $pdo->prepare(
-                        'SELECT plan_code, billing_cycle
+                        'SELECT plan_code, billing_cycle, plan_status
                          FROM tenant_companies
                          WHERE signup_id = :signup_id
                          LIMIT 1'
@@ -353,7 +354,7 @@ if ($view['error'] === '') {
 
                     if (!$tenantPlanRow) {
                         $stTenantByEmail = $pdo->prepare(
-                            'SELECT plan_code, billing_cycle
+                            'SELECT plan_code, billing_cycle, plan_status
                              FROM tenant_companies
                              WHERE LOWER(owner_email) = LOWER(:owner_email)
                              LIMIT 1'
@@ -373,20 +374,28 @@ if ($view['error'] === '') {
                             $billingCycle = $tenantBillingCycle;
                         }
 
+                        $tenantPlanStatus = strtolower(trim((string)($tenantPlanRow['plan_status'] ?? '')));
+                        if ($tenantPlanStatus === 'paid') {
+                            $effectivePaymentStatus = 'paid';
+                        }
+
                         if (
                             $signupPlanCode !== normalize_plan_code((string)$signup['plan_code'], 'basico')
                             || $billingCycle !== strtolower(trim((string)($signup['billing_cycle'] ?? 'monthly')))
+                            || ($effectivePaymentStatus === 'paid' && strtolower(trim((string)($signup['payment_status'] ?? 'unpaid'))) !== 'paid')
                         ) {
                             $upSignupPlan = $pdo->prepare(
                                 'UPDATE account_signups
                                  SET plan_code = :plan_code,
-                                     billing_cycle = :billing_cycle
+                                     billing_cycle = :billing_cycle,
+                                     payment_status = :payment_status
                                  WHERE id = :id
                                  LIMIT 1'
                             );
                             $upSignupPlan->execute([
                                 'plan_code' => $signupPlanCode,
                                 'billing_cycle' => $billingCycle,
+                                'payment_status' => $effectivePaymentStatus,
                                 'id' => (int)$signup['id'],
                             ]);
                         }
@@ -421,7 +430,7 @@ if ($view['error'] === '') {
                 $view['email'] = (string)$signup['email'];
                 $view['payer_email'] = (string)$signup['email'];
                 $view['status'] = (string)$signup['status'];
-                $view['payment_status'] = (string)$signup['payment_status'];
+                $view['payment_status'] = $effectivePaymentStatus;
                 $view['signup_plan_code'] = $signupPlanCode;
                 $view['plan_code'] = $planCode;
                 $view['plan_name'] = plan_display_name($planCode);
