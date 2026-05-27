@@ -1,4 +1,7 @@
 <?php
+require_once __DIR__ . '/security-helpers.php';
+security_apply_web_headers();
+
 function h($value)
 {
     return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
@@ -21,6 +24,21 @@ function ensure_column(PDO $pdo, $tableName, $columnName, $definitionSql)
     if (!$st->fetchColumn()) {
         $pdo->exec('ALTER TABLE `' . $tableName . '` ADD COLUMN `' . $columnName . '` ' . $definitionSql);
     }
+}
+
+function table_exists(PDO $pdo, $tableName)
+{
+    $st = $pdo->prepare(
+        'SELECT 1
+         FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = :table_name
+         LIMIT 1'
+    );
+    $st->execute([
+        'table_name' => $tableName,
+    ]);
+    return (bool)$st->fetchColumn();
 }
 
 function load_secure_mp_credentials()
@@ -127,12 +145,27 @@ function plan_display_name($planCode)
 {
     $code = strtolower(trim((string)$planCode));
     if ($code === 'pro') {
-        return 'Pro';
+        return 'Heroe';
     }
     if ($code === 'enterprise') {
-        return 'Enterprise';
+        return 'Semidios';
     }
-    return 'Basico';
+    return 'Mortal';
+}
+
+function normalize_plan_code($planCode, $fallback = '')
+{
+    $code = strtolower(trim((string)$planCode));
+    if (in_array($code, ['heroe', 'pro'], true)) {
+        return 'pro';
+    }
+    if (in_array($code, ['semidios', 'semi_dios', 'enterprise'], true)) {
+        return 'enterprise';
+    }
+    if (in_array($code, ['basico', 'basic', 'mortal'], true)) {
+        return 'basico';
+    }
+    return (string)$fallback;
 }
 
 function default_plan_prices_clp()
@@ -147,12 +180,15 @@ function default_plan_prices_clp()
 $view = [
     'ok' => false,
     'error' => '',
+    'already_paid_same_plan' => false,
+    'already_paid_message' => '',
     'company_name' => '',
     'email' => '',
     'status' => '',
     'payment_status' => '',
+    'signup_plan_code' => 'basico',
     'payer_email' => '',
-    'plan_name' => 'Basico',
+    'plan_name' => 'Mortal',
     'plan_code' => 'basico',
     'billing_cycle' => 'monthly',
     'billing_cycle_name' => 'Mensual',
@@ -161,6 +197,7 @@ $view = [
 ];
 
 $paymentToken = trim((string)($_GET['pt'] ?? ''));
+$requestedTargetPlan = normalize_plan_code((string)($_GET['tp'] ?? ''), '');
 if ($paymentToken === '' || strlen($paymentToken) < 40) {
     $view['error'] = 'El enlace de pago no es valido o expiro.';
 }
@@ -174,8 +211,11 @@ if ($view['error'] === '') {
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
         ]);
 
-        $pdo->exec(
-            'CREATE TABLE IF NOT EXISTS account_signups (
+        security_ensure_tables($pdo);
+
+        if (!table_exists($pdo, 'account_signups')) {
+          $pdo->exec(
+            'CREATE TABLE account_signups (
                 id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                 email VARCHAR(190) NOT NULL,
                 company_name VARCHAR(190) NOT NULL,
@@ -191,10 +231,12 @@ if ($view['error'] === '') {
                 UNIQUE KEY uq_account_signups_email (email),
                 KEY idx_account_signups_status (status)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
-        );
+                    );
+                }
 
-        $pdo->exec(
-            'CREATE TABLE IF NOT EXISTS payment_method_settings (
+                if (!table_exists($pdo, 'payment_method_settings')) {
+                    $pdo->exec(
+                        'CREATE TABLE payment_method_settings (
                 id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                 method_code VARCHAR(50) NOT NULL,
                 is_enabled TINYINT(1) NOT NULL DEFAULT 0,
@@ -206,10 +248,12 @@ if ($view['error'] === '') {
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 UNIQUE KEY uq_payment_method_code (method_code)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
-        );
+                    );
+                }
 
-        $pdo->exec(
-            'CREATE TABLE IF NOT EXISTS payment_transactions (
+                if (!table_exists($pdo, 'payment_transactions')) {
+                    $pdo->exec(
+                        'CREATE TABLE payment_transactions (
                 id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                 signup_id BIGINT UNSIGNED NOT NULL,
                 provider VARCHAR(30) NOT NULL,
@@ -227,10 +271,12 @@ if ($view['error'] === '') {
                 KEY idx_payment_signup (signup_id),
                 KEY idx_payment_reference (external_reference)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
-        );
+                    );
+                }
 
-        $pdo->exec(
-            'CREATE TABLE IF NOT EXISTS plan_pricing (
+                if (!table_exists($pdo, 'plan_pricing')) {
+                    $pdo->exec(
+                        'CREATE TABLE plan_pricing (
                 id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                 plan_code VARCHAR(40) NOT NULL,
                 amount_clp INT UNSIGNED NOT NULL DEFAULT 350,
@@ -240,7 +286,8 @@ if ($view['error'] === '') {
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 UNIQUE KEY uq_plan_pricing_code (plan_code)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
-        );
+                    );
+                }
 
         $seedPlanPrice = $pdo->prepare(
             'INSERT INTO plan_pricing (plan_code, amount_clp, monthly_amount_clp, annual_amount_clp)
@@ -269,7 +316,7 @@ if ($view['error'] === '') {
         ensure_column($pdo, 'payment_method_settings', 'access_token_enc', 'TEXT NULL');
 
         $stSignup = $pdo->prepare(
-            'SELECT id, email, company_name, status, payment_status, plan_code, billing_cycle, email_verified_at, payment_access_expires_at
+            'SELECT id, email, company_name, status, payment_status, plan_code, billing_cycle, tenant_company_id, email_verified_at, payment_access_expires_at
              FROM account_signups
              WHERE payment_access_token = :payment_access_token
              LIMIT 1'
@@ -286,13 +333,68 @@ if ($view['error'] === '') {
             } elseif (empty($signup['email_verified_at'])) {
                 $view['error'] = 'Tu correo aun no esta verificado. Verifica el correo antes de pagar.';
             } else {
-                $planCode = strtolower(trim((string)$signup['plan_code']));
-                if (!in_array($planCode, ['basico', 'pro', 'enterprise'], true)) {
-                    $planCode = 'basico';
-                }
+                $signupPlanCode = normalize_plan_code((string)$signup['plan_code'], 'basico');
+                $planCode = $requestedTargetPlan;
                 $billingCycle = strtolower(trim((string)($signup['billing_cycle'] ?? 'monthly')));
                 if (!in_array($billingCycle, ['monthly', 'annual'], true)) {
                     $billingCycle = 'monthly';
+                }
+
+                // Si el plan fue ajustado desde admin master, tenant_companies es la fuente efectiva.
+                if (table_exists($pdo, 'tenant_companies')) {
+                    $stTenantPlan = $pdo->prepare(
+                        'SELECT plan_code, billing_cycle
+                         FROM tenant_companies
+                         WHERE signup_id = :signup_id
+                         LIMIT 1'
+                    );
+                    $stTenantPlan->execute(['signup_id' => (int)$signup['id']]);
+                    $tenantPlanRow = $stTenantPlan->fetch();
+
+                    if (!$tenantPlanRow) {
+                        $stTenantByEmail = $pdo->prepare(
+                            'SELECT plan_code, billing_cycle
+                             FROM tenant_companies
+                             WHERE LOWER(owner_email) = LOWER(:owner_email)
+                             LIMIT 1'
+                        );
+                        $stTenantByEmail->execute(['owner_email' => (string)$signup['email']]);
+                        $tenantPlanRow = $stTenantByEmail->fetch();
+                    }
+
+                    if ($tenantPlanRow) {
+                        $tenantPlanCode = normalize_plan_code((string)($tenantPlanRow['plan_code'] ?? ''), '');
+                        if (in_array($tenantPlanCode, ['basico', 'pro', 'enterprise'], true)) {
+                            $signupPlanCode = $tenantPlanCode;
+                        }
+
+                        $tenantBillingCycle = strtolower(trim((string)($tenantPlanRow['billing_cycle'] ?? '')));
+                        if (in_array($tenantBillingCycle, ['monthly', 'annual'], true)) {
+                            $billingCycle = $tenantBillingCycle;
+                        }
+
+                        if (
+                            $signupPlanCode !== normalize_plan_code((string)$signup['plan_code'], 'basico')
+                            || $billingCycle !== strtolower(trim((string)($signup['billing_cycle'] ?? 'monthly')))
+                        ) {
+                            $upSignupPlan = $pdo->prepare(
+                                'UPDATE account_signups
+                                 SET plan_code = :plan_code,
+                                     billing_cycle = :billing_cycle
+                                 WHERE id = :id
+                                 LIMIT 1'
+                            );
+                            $upSignupPlan->execute([
+                                'plan_code' => $signupPlanCode,
+                                'billing_cycle' => $billingCycle,
+                                'id' => (int)$signup['id'],
+                            ]);
+                        }
+                    }
+                }
+
+                if (!in_array($planCode, ['basico', 'pro', 'enterprise'], true)) {
+                    $planCode = $signupPlanCode;
                 }
 
                 $stPlanPrice = $pdo->prepare('SELECT amount_clp, monthly_amount_clp, annual_amount_clp FROM plan_pricing WHERE plan_code = :plan_code LIMIT 1');
@@ -320,28 +422,103 @@ if ($view['error'] === '') {
                 $view['payer_email'] = (string)$signup['email'];
                 $view['status'] = (string)$signup['status'];
                 $view['payment_status'] = (string)$signup['payment_status'];
+                $view['signup_plan_code'] = $signupPlanCode;
                 $view['plan_code'] = $planCode;
                 $view['plan_name'] = plan_display_name($planCode);
                 $view['billing_cycle'] = $billingCycle;
                 $view['billing_cycle_name'] = ($billingCycle === 'annual') ? 'Anual' : 'Mensual';
                 $view['amount'] = (string)$amountByPlan;
+
+                $isSamePaidPlanNow = (strtolower(trim((string)$view['payment_status'])) === 'paid') && ($planCode === $signupPlanCode);
+                if ($isSamePaidPlanNow) {
+                    $view['already_paid_same_plan'] = true;
+                    $view['already_paid_message'] = 'Tu plan ' . $view['plan_name'] . ' ya se encuentra al dia. No necesitas realizar un pago adicional.';
+                }
+
+                if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                    $postedTargetPlan = normalize_plan_code((string)($_POST['target_plan'] ?? ''), '');
+                    if (in_array($postedTargetPlan, ['basico', 'pro', 'enterprise'], true)) {
+                        $view['plan_code'] = $postedTargetPlan;
+                        $view['plan_name'] = plan_display_name($postedTargetPlan);
+                    }
+                }
             }
         }
 
         if ($view['ok'] && $_SERVER['REQUEST_METHOD'] === 'POST' && (string)($_POST['action'] ?? '') === 'create_checkout') {
-            if ((string)$view['payment_status'] === 'paid') {
-                header('Location: /pago-resultado/?s=ok');
-                exit;
+            $clientIp = security_client_ip();
+            $ipRate = security_rate_limit_check($pdo, 'public-checkout:ip:' . $clientIp, 10, 60);
+            $tokenRate = security_rate_limit_check($pdo, 'public-checkout:token:' . substr(hash('sha256', $paymentToken), 0, 24), 4, 60);
+            if (!$ipRate['allowed'] || !$tokenRate['allowed']) {
+                try {
+                    security_audit_log($pdo, [
+                        'tenant_company_id' => isset($signup['tenant_company_id']) ? (int)$signup['tenant_company_id'] : null,
+                        'actor_email' => (string)($view['email'] ?? ''),
+                        'action_name' => 'public_checkout_rate_limited',
+                        'entity_name' => 'public_checkout',
+                        'entity_id' => substr(hash('sha256', $paymentToken), 0, 12),
+                        'result_status' => 'blocked',
+                        'ip_address' => $clientIp,
+                        'detail' => [
+                            'retry_after' => max((int)$ipRate['retry_after'], (int)$tokenRate['retry_after']),
+                            'plan_code' => (string)($view['plan_code'] ?? ''),
+                        ],
+                    ]);
+                } catch (Throwable $auditError) {
+                }
+                $view['error'] = 'Detectamos demasiados intentos seguidos. Espera 1 minuto para volver a intentar.';
+                $view['ok'] = false;
+            }
+
+            if (!$view['ok']) {
+                throw new RuntimeException('checkout_rate_limited');
+            }
+
+            $checkoutPlanCode = normalize_plan_code((string)($_POST['target_plan'] ?? $view['plan_code']), 'basico');
+            $view['plan_code'] = $checkoutPlanCode;
+            $view['plan_name'] = plan_display_name($checkoutPlanCode);
+
+            $stCheckoutPrice = $pdo->prepare('SELECT amount_clp, monthly_amount_clp, annual_amount_clp FROM plan_pricing WHERE plan_code = :plan_code LIMIT 1');
+            $stCheckoutPrice->execute(['plan_code' => $checkoutPlanCode]);
+            $checkoutPrice = $stCheckoutPrice->fetch();
+            $checkoutAmount = 0;
+            if ($checkoutPrice) {
+                if ($view['billing_cycle'] === 'annual') {
+                    $checkoutAmount = (int)($checkoutPrice['annual_amount_clp'] ?? 0);
+                } else {
+                    $checkoutAmount = (int)($checkoutPrice['monthly_amount_clp'] ?? 0);
+                }
+                if ($checkoutAmount < 350) {
+                    $checkoutAmount = (int)($checkoutPrice['amount_clp'] ?? 0);
+                }
+            }
+            if ($checkoutAmount < 350) {
+                $defaults = default_plan_prices_clp();
+                $checkoutAmount = (int)(($defaults[$checkoutPlanCode][$view['billing_cycle']] ?? 350));
+            }
+            $view['amount'] = (string)$checkoutAmount;
+
+            $isSamePaidPlan = ((string)$view['payment_status'] === 'paid') && ($checkoutPlanCode === (string)$view['signup_plan_code']);
+            if ($isSamePaidPlan) {
+                $view['already_paid_same_plan'] = true;
+                $view['already_paid_message'] = 'Tu plan ' . $view['plan_name'] . ' ya se encuentra al dia. No necesitas realizar un pago adicional.';
             }
 
             // Revalida contra DB para bloquear doble pago si la cuenta ya se marco como pagada entre solicitudes.
             $stFreshSignup = $pdo->prepare('SELECT payment_status FROM account_signups WHERE id = :id LIMIT 1');
             $stFreshSignup->execute(['id' => (int)$signup['id']]);
             $freshPaymentStatus = strtolower(trim((string)$stFreshSignup->fetchColumn()));
-            if ($freshPaymentStatus === 'paid') {
-                header('Location: /pago-resultado/?s=ok');
-                exit;
+            if ($freshPaymentStatus === 'paid' && $checkoutPlanCode === (string)$view['signup_plan_code']) {
+                $view['already_paid_same_plan'] = true;
+                $view['already_paid_message'] = 'Tu plan ' . $view['plan_name'] . ' ya se encuentra al dia. No necesitas realizar un pago adicional.';
             }
+
+            if (!$view['already_paid_same_plan']) {
+                $upRequestedPlan = $pdo->prepare('UPDATE account_signups SET plan_code = :plan_code WHERE id = :id LIMIT 1');
+                $upRequestedPlan->execute([
+                    'plan_code' => $checkoutPlanCode,
+                    'id' => (int)$signup['id'],
+                ]);
 
             $stPay = $pdo->prepare(
                 'SELECT is_enabled, environment, public_key, access_token, public_key_enc, access_token_enc, webhook_url
@@ -404,83 +581,84 @@ if ($view['error'] === '') {
                 }
             }
 
-            if (!$payCfg || (int)$payCfg['is_enabled'] !== 1) {
-                $view['error'] = 'La pasarela de pago aun no esta habilitada. Intenta en unos minutos.';
-            } elseif (trim((string)($payCfg['public_key'] ?? '')) === '' || trim((string)($payCfg['access_token'] ?? '')) === '') {
-                $view['error'] = 'La pasarela no tiene credenciales completas para procesar pagos.';
-            } else {
-                $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-                $host = $_SERVER['HTTP_HOST'] ?? 'gesmanolympus.com';
-                $externalReference = 'signup:' . (int)$signup['id'];
-                $commerceOrder = $externalReference . ':' . time();
-                $notificationUrl = trim((string)($payCfg['webhook_url'] ?? ''));
-                if ($notificationUrl === '') {
-                    $notificationUrl = $scheme . '://' . $host . '/webhook/flow/';
-                }
-                $returnUrl = $scheme . '://' . $host . '/pago-resultado/?s=pending';
-
-                $payerEmail = trim((string)($_POST['payer_email'] ?? $view['payer_email'] ?? $view['email'] ?? ''));
-                if (!filter_var($payerEmail, FILTER_VALIDATE_EMAIL)) {
-                    $view['error'] = 'Debes ingresar un email valido para continuar con Flow.';
-                }
-
-                if ($view['error'] !== '') {
-                    // Evita invocar Flow cuando faltan datos base del pagador.
+                if (!$payCfg || (int)$payCfg['is_enabled'] !== 1) {
+                    $view['error'] = 'La pasarela de pago aun no esta habilitada. Intenta en unos minutos.';
+                } elseif (trim((string)($payCfg['public_key'] ?? '')) === '' || trim((string)($payCfg['access_token'] ?? '')) === '') {
+                    $view['error'] = 'La pasarela no tiene credenciales completas para procesar pagos.';
                 } else {
-                    $view['payer_email'] = $payerEmail;
+                    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+                    $host = $_SERVER['HTTP_HOST'] ?? 'gesmanolympus.com';
+                    $externalReference = 'signup:' . (int)$signup['id'];
+                    $commerceOrder = $externalReference . ':' . time();
+                    $notificationUrl = trim((string)($payCfg['webhook_url'] ?? ''));
+                    if ($notificationUrl === '') {
+                        $notificationUrl = $scheme . '://' . $host . '/webhook/flow/';
+                    }
+                    $returnUrl = $scheme . '://' . $host . '/pago-resultado/?s=pending';
 
-                    $payload = [
-                        'commerceOrder' => $commerceOrder,
-                        'subject' => 'Plan ' . $view['plan_name'] . ' ' . $view['billing_cycle_name'] . ' GesMan HERMES',
-                        'currency' => 'CLP',
-                        'amount' => (int)round((float)$view['amount']),
-                        'email' => $payerEmail,
-                        'urlConfirmation' => $notificationUrl,
-                        'urlReturn' => $returnUrl,
-                    ];
+                    $payerEmail = trim((string)($_POST['payer_email'] ?? $view['payer_email'] ?? $view['email'] ?? ''));
+                    if (!filter_var($payerEmail, FILTER_VALIDATE_EMAIL)) {
+                        $view['error'] = 'Debes ingresar un email valido para continuar con Flow.';
+                    }
 
-                    $flow = flow_request('POST', '/payment/create', (string)$payCfg['public_key'], (string)$payCfg['access_token'], $payload, (string)$payCfg['environment']);
-                    if (!$flow['ok'] || !is_array($flow['data'])) {
-                        $flowCode = is_array($flow['data']) ? (int)($flow['data']['code'] ?? 0) : 0;
-                        error_log(
-                            'HERMES_FLOW_CREATE_ERROR: http=' . (int)$flow['http_code']
-                            . ' curl=' . (string)($flow['error'] ?? '')
-                            . ' payload=' . json_encode($payload, JSON_UNESCAPED_UNICODE)
-                            . ' response=' . (string)($flow['raw'] ?? '')
-                        );
-                        if ($flowCode === 1901) {
-                            $view['error'] = 'Flow exige un monto minimo de $350 CLP para iniciar el checkout.';
-                        } elseif ($flowCode === 1620) {
-                            $view['error'] = 'Flow rechazo el email del pagador. Prueba con otro correo real y vuelve a intentar.';
-                        } else {
-                            $view['error'] = 'No se pudo iniciar el checkout con Flow. Intenta nuevamente.';
-                        }
+                    if ($view['error'] !== '') {
+                        // Evita invocar Flow cuando faltan datos base del pagador.
                     } else {
-                        $flowUrl = (string)($flow['data']['url'] ?? '');
-                        $flowToken = (string)($flow['data']['token'] ?? '');
-                        $redirectUrl = ($flowUrl !== '' && $flowToken !== '') ? ($flowUrl . '?token=' . rawurlencode($flowToken)) : '';
+                        $view['payer_email'] = $payerEmail;
 
-                        if ($redirectUrl === '') {
-                            $view['error'] = 'Flow no devolvio una URL valida de pago.';
-                        } else {
-                            $insTx = $pdo->prepare(
-                                'INSERT INTO payment_transactions (signup_id, provider, external_reference, preference_id, status, amount, currency_id, idempotency_key, raw_payload_json)
-                                 VALUES (:signup_id, :provider, :external_reference, :preference_id, :status, :amount, :currency_id, :idempotency_key, :raw_payload_json)'
+                        $payload = [
+                            'commerceOrder' => $commerceOrder,
+                            'subject' => 'Plan ' . $view['plan_name'] . ' ' . $view['billing_cycle_name'] . ' GesMan HERMES',
+                            'currency' => 'CLP',
+                            'amount' => (int)round((float)$view['amount']),
+                            'email' => $payerEmail,
+                            'urlConfirmation' => $notificationUrl,
+                            'urlReturn' => $returnUrl,
+                        ];
+
+                        $flow = flow_request('POST', '/payment/create', (string)$payCfg['public_key'], (string)$payCfg['access_token'], $payload, (string)$payCfg['environment']);
+                        if (!$flow['ok'] || !is_array($flow['data'])) {
+                            $flowCode = is_array($flow['data']) ? (int)($flow['data']['code'] ?? 0) : 0;
+                            error_log(
+                                'HERMES_FLOW_CREATE_ERROR: http=' . (int)$flow['http_code']
+                                . ' curl=' . (string)($flow['error'] ?? '')
+                                . ' payload=' . json_encode($payload, JSON_UNESCAPED_UNICODE)
+                                . ' response=' . (string)($flow['raw'] ?? '')
                             );
-                            $insTx->execute([
-                                'signup_id' => (int)$signup['id'],
-                                'provider' => 'flow',
-                                'external_reference' => $externalReference,
-                                'preference_id' => $flowToken,
-                                'status' => 'payment_created',
-                                'amount' => (float)$view['amount'],
-                                'currency_id' => $view['currency_id'],
-                                'idempotency_key' => bin2hex(random_bytes(12)),
-                                'raw_payload_json' => json_encode($flow['data'], JSON_UNESCAPED_UNICODE),
-                            ]);
+                            if ($flowCode === 1901) {
+                                $view['error'] = 'Flow exige un monto minimo de $350 CLP para iniciar el checkout.';
+                            } elseif ($flowCode === 1620) {
+                                $view['error'] = 'Flow rechazo el email del pagador. Prueba con otro correo real y vuelve a intentar.';
+                            } else {
+                                $view['error'] = 'No se pudo iniciar el checkout con Flow. Intenta nuevamente.';
+                            }
+                        } else {
+                            $flowUrl = (string)($flow['data']['url'] ?? '');
+                            $flowToken = (string)($flow['data']['token'] ?? '');
+                            $redirectUrl = ($flowUrl !== '' && $flowToken !== '') ? ($flowUrl . '?token=' . rawurlencode($flowToken)) : '';
 
-                            header('Location: ' . $redirectUrl);
-                            exit;
+                            if ($redirectUrl === '') {
+                                $view['error'] = 'Flow no devolvio una URL valida de pago.';
+                            } else {
+                                $insTx = $pdo->prepare(
+                                    'INSERT INTO payment_transactions (signup_id, provider, external_reference, preference_id, status, amount, currency_id, idempotency_key, raw_payload_json)
+                                     VALUES (:signup_id, :provider, :external_reference, :preference_id, :status, :amount, :currency_id, :idempotency_key, :raw_payload_json)'
+                                );
+                                $insTx->execute([
+                                    'signup_id' => (int)$signup['id'],
+                                    'provider' => 'flow',
+                                    'external_reference' => $externalReference,
+                                    'preference_id' => $flowToken,
+                                    'status' => 'payment_created',
+                                    'amount' => (float)$view['amount'],
+                                    'currency_id' => $view['currency_id'],
+                                    'idempotency_key' => bin2hex(random_bytes(12)),
+                                    'raw_payload_json' => json_encode($flow['data'], JSON_UNESCAPED_UNICODE),
+                                ]);
+
+                                header('Location: ' . $redirectUrl);
+                                exit;
+                            }
                         }
                     }
                 }
@@ -488,7 +666,9 @@ if ($view['error'] === '') {
         }
     } catch (Throwable $e) {
         error_log('HERMES_FLOW_CHECKOUT_INIT_ERROR: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
-        $view['error'] = 'No fue posible inicializar el pago en este momento.';
+        if ((string)$e->getMessage() !== 'checkout_rate_limited') {
+            $view['error'] = 'No fue posible inicializar el pago en este momento.';
+        }
     }
 }
 ?>
@@ -595,40 +775,58 @@ if ($view['error'] === '') {
       background: #0f172a;
       color: #cbd5e1;
     }
+        .btn.app {
+            border-color: #14532d;
+            background: linear-gradient(180deg, #86efac, #22c55e);
+            color: #052e16;
+        }
   </style>
 </head>
 <body>
   <main class="card">
-        <h1>Pagar plan <?= h($view['plan_name']) ?></h1>
-        <p>Este pago permite validar el flujo real de onboarding y activacion con resguardos de seguridad.</p>
+                <h1><?= $view['already_paid_same_plan'] ? 'Plan al dia' : ('Pagar plan ' . h($view['plan_name'])) ?></h1>
+                <p>
+                    <?php if ($view['already_paid_same_plan']): ?>
+                        Tu cuenta ya se encuentra al dia para el plan seleccionado.
+                    <?php else: ?>
+                        Este pago permite validar el flujo real de onboarding y activacion con resguardos de seguridad.
+                    <?php endif; ?>
+                </p>
 
     <?php if ($view['error'] !== ''): ?>
       <div class="msg err"><?= h($view['error']) ?></div>
     <?php endif; ?>
 
     <?php if ($view['ok']): ?>
+            <?php if ($view['already_paid_same_plan']): ?>
+            <div class="msg ok" style="margin-bottom:.9rem;"><?= h($view['already_paid_message']) ?></div>
+            <?php endif; ?>
       <div class="summary">
         <p><strong>Empresa:</strong> <?= h($view['company_name']) ?></p>
         <p><strong>Correo:</strong> <?= h($view['email']) ?></p>
         <p><strong>Plan:</strong> <?= h($view['plan_name']) ?></p>
         <p><strong>Modalidad:</strong> <?= h($view['billing_cycle_name']) ?></p>
-        <p><strong>Monto:</strong> <?= h($view['amount']) ?> <?= h($view['currency_id']) ?></p>
+                <p><strong>Monto:</strong> <?= h($view['amount']) ?> <?= h($view['currency_id']) ?></p>
         <ul class="list">
-          <li>Acceso habilitado solo al confirmar pago aprobado.</li>
+                    <li>Acceso habilitado solo al confirmar pago aprobado.</li>
                     <li>Validacion de transaccion contra API oficial de Flow.</li>
           <li>Registro transaccional e idempotencia para evitar doble activacion.</li>
         </ul>
       </div>
 
       <div class="actions">
+                <?php if (!$view['already_paid_same_plan']): ?>
         <form method="post" style="margin:0;">
           <input type="hidden" name="action" value="create_checkout">
+                    <input type="hidden" name="target_plan" value="<?= h($view['plan_code']) ?>">
                     <div class="payer-row">
                         <label for="payer_email">Email del pagador (Flow)</label>
                         <input id="payer_email" name="payer_email" type="email" value="<?= h($view['payer_email'] !== '' ? $view['payer_email'] : $view['email']) ?>" required>
                     </div>
                     <button class="btn" type="submit">Pagar ahora con Flow</button>
         </form>
+                <?php endif; ?>
+                <a class="btn app" href="/empresa/dashboard/?module=plan">Volver a la app</a>
         <a class="btn ghost" href="/">Volver al sitio</a>
       </div>
     <?php endif; ?>
