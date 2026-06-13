@@ -785,8 +785,8 @@ $year = date('Y');
             <li>Tablero operativo centralizado para el responsable</li>
           </ul>
           <div class="card-cta-row">
-            <a class="card-cta primary" href="/hermes-vitrina.php">Conoce sus funciones</a>
-            <a class="card-cta ghost" href="https://gesmanhermes.com/" target="_blank" rel="noopener">Ir al sitio HERMES</a>
+            <a class="card-cta primary" href="https://gesmanhermes.com/" target="_blank" rel="noopener">Ir a la página</a>
+            <a class="card-cta ghost" href="#contacto">Hablar con ventas</a>
           </div>
         </article>
 

@@ -19,9 +19,6 @@ RewriteRule ^ - [L]
 # Landing section routes without hash (#)
 RewriteRule ^(top|que-es|modulos|beneficios|contacto)/?$ index.php [L,QSA]
 
-# Vitrina routes within olympus
-RewriteRule ^hermes-vitrina/?$ hermes-vitrina.php [L,QSA]
-
 # Extensionless route -> PHP file when it exists
 RewriteCond %{REQUEST_FILENAME}.php -f
 RewriteRule ^(.+?)/?$ $1.php [L,QSA]
