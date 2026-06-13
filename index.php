@@ -661,7 +661,7 @@ $year = date('Y');
 
     <div class="container hero-content">
       <span class="eyebrow">La Vitrina de la Suite GesMan</span>
-      <h1 class="display">OLYMPUS</h1>
+      <h1 class="display">OLIMPUSSS</h1>
       <p class="subtitle">El Monte de los Sistemas de Gestión</p>
       <p class="tagline">
         En la cima del Olimpo habitan los héroes, dioses y semidioses que dan forma al futuro de
