@@ -18,8 +18,8 @@ $year = date('Y');
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://gesmanolympus.com/hermes-vitrina">
   <link rel="canonical" href="https://gesmanolympus.com/hermes-vitrina">
-  <link rel="icon" type="image/svg+xml" href="assets/img/favicon-olympus.svg">
-  <link rel="shortcut icon" href="assets/img/favicon-olympus.svg" type="image/svg+xml">
+  <link rel="icon" type="image/svg+xml" href="/assets/img/favicon-olympus.svg">
+  <link rel="shortcut icon" href="/assets/img/favicon-olympus.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -642,9 +642,9 @@ $year = date('Y');
       <div>
         © <?= $year ?> GesMan · El monte donde habitan los héroes del software de gestión.
         <div class="footer-legal" aria-label="Enlaces legales">
-          <a href="politica-privacidad.php">Política de Privacidad</a>
-          <a href="politica-cookies.php">Política de Cookies</a>
-          <a href="terminos-condiciones.php">Términos y Condiciones</a>
+          <a href="/politica-privacidad.php">Política de Privacidad</a>
+          <a href="/politica-cookies.php">Política de Cookies</a>
+          <a href="/terminos-condiciones.php">Términos y Condiciones</a>
         </div>
         <div style="margin-top:.5rem;color:#a8b0c0;font-size:.86rem;">
           HERMES es un producto de la suite GesMan · 
