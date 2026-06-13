@@ -19,8 +19,8 @@ $year = date('Y');
   <title>GesMan OLYMPUS — El Monte de los Sistemas de Gestión</title>
   <meta name="description" content="GesMan OLYMPUS es la vitrina de la suite GesMan. Conoce a ATLAS (CMMS) y HERMES (gestión de servicios técnicos), los héroes que llevan la operación de tu empresa al siguiente nivel.">
   <meta name="theme-color" content="#0A0E1F">
-  <link rel="icon" type="image/svg+xml" href="assets/img/favicon-olympus.svg">
-  <link rel="shortcut icon" href="assets/img/favicon-olympus.svg" type="image/svg+xml">
+  <link rel="icon" type="image/svg+xml" href="/assets/img/favicon-olympus.svg">
+  <link rel="shortcut icon" href="/assets/img/favicon-olympus.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -743,7 +743,7 @@ $year = date('Y');
           <div class="glow" aria-hidden="true"></div>
           <span class="card-tag">El Titán · CMMS</span>
           <div class="card-logo">
-            <img src="assets/img/logo-atlas-white.svg" alt="GesMan ATLAS" loading="lazy" width="240" height="56">
+            <img src="/assets/img/logo-atlas-white.svg" alt="GesMan ATLAS" loading="lazy" width="240" height="56">
           </div>
           <p class="card-subtitle">Sostiene el mundo del mantenimiento.</p>
           <p class="card-desc">
@@ -759,7 +759,7 @@ $year = date('Y');
             <li>Gestión de personal técnico, certificaciones y reuniones</li>
           </ul>
           <div class="card-cta-row">
-            <a class="card-cta primary" href="gesman-atlas.php">Conoce sus funciones</a>
+            <a class="card-cta primary" href="/gesman-atlas.php">Conoce sus funciones</a>
             <a class="card-cta ghost" href="#contacto">Hablar con ventas</a>
           </div>
         </article>
@@ -769,7 +769,7 @@ $year = date('Y');
           <div class="glow" aria-hidden="true"></div>
           <span class="card-tag">El Mensajero · Servicios Técnicos</span>
           <div class="card-logo">
-            <img src="assets/img/logo-hermes-white.svg" alt="GesMan HERMES" loading="lazy" width="240" height="56">
+            <img src="/assets/img/logo-hermes-white.svg" alt="GesMan HERMES" loading="lazy" width="240" height="56">
           </div>
           <p class="card-subtitle">Conecta clientes, técnicos y servicio.</p>
           <p class="card-desc">
@@ -785,7 +785,7 @@ $year = date('Y');
             <li>Tablero operativo centralizado para el responsable</li>
           </ul>
           <div class="card-cta-row">
-            <a class="card-cta primary" href="hermes-vitrina.php">Conoce sus funciones</a>
+            <a class="card-cta primary" href="/hermes-vitrina.php">Conoce sus funciones</a>
             <a class="card-cta ghost" href="https://gesmanhermes.com/" target="_blank" rel="noopener">Ir al sitio HERMES</a>
           </div>
         </article>
@@ -861,9 +861,9 @@ $year = date('Y');
       <div>
         © <?= $year ?> GesMan · El monte donde habitan los héroes del software de gestión.
         <div class="footer-legal" aria-label="Enlaces legales">
-          <a href="politica-privacidad.php">Política de Privacidad</a>
-          <a href="politica-cookies.php">Política de Cookies</a>
-          <a href="terminos-condiciones.php">Términos y Condiciones</a>
+          <a href="/politica-privacidad.php">Política de Privacidad</a>
+          <a href="/politica-cookies.php">Política de Cookies</a>
+          <a href="/terminos-condiciones.php">Términos y Condiciones</a>
         </div>
         <div style="margin-top:.55rem;color:#a8b0c0;font-size:.86rem;">
           Soporte comercial: <a href="mailto:contacto@gesmanolympus.com?subject=Soporte%20GesMan%20OLYMPUS">contacto@gesmanolympus.com</a>
@@ -885,8 +885,8 @@ $year = date('Y');
         <button type="button" class="cookie-btn" data-cookie-action="essential-only">Solo esenciales</button>
       </div>
       <div class="cookie-links">
-        <a href="politica-cookies.php">Ver Política de Cookies</a>
-        <a href="politica-privacidad.php">Ver Política de Privacidad</a>
+        <a href="/politica-cookies.php">Ver Política de Cookies</a>
+        <a href="/politica-privacidad.php">Ver Política de Privacidad</a>
       </div>
     </div>
   </aside>
