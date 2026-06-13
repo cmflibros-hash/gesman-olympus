@@ -1,0 +1,23 @@
+# Archivo de configuracion especifico del VPS (no versionar)
+.htaccess
+
+# Credenciales y secretos (los templates .example.php si se versionan)
+.flow_credentials.php
+.mail_credentials.php
+.mp_credentials.php
+.mp_secrets_key.php
+.backup_encryption_key.php
+.backup_offsite.php
+
+# Marcadores de seguridad y staging locales
+.security/
+
+# Archivos temporales
+_tmp_*.py
+_tmp_*.ps1
+_tmp_*.sh
+__debug_report_data.php
+tmp-*.php
+
+# PDFs generados (cotizaciones, vistas)
+*.pdf
